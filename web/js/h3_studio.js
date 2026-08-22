@@ -4830,6 +4830,13 @@ function buildStudio(node) {
   return box;
 }
 
+// 主节点标题栏：显式设置为暗红色，避免被 ComfyUI 的输出节点默认绿色覆盖。
+const H3_STUDIO_TITLE_COLOR = "#7A1F2B";
+function applyStudioNodePalette(node) {
+  node.color = H3_STUDIO_TITLE_COLOR;
+  if (typeof node.setDirtyCanvas === "function") node.setDirtyCanvas(true, true);
+}
+
 app.registerExtension({
   name: "H3Director.Studio",
   async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -4837,6 +4844,7 @@ app.registerExtension({
     const orig = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const r = orig ? orig.apply(this, arguments) : undefined;
+      applyStudioNodePalette(this);
       const container = document.createElement("div");
       container.style.cssText = "width:100%;height:430px;";
       const dw = this.addDOMWidget("director_ui", "h3studio", container, { serialize: false, hideOnZoom: false });
@@ -4884,6 +4892,7 @@ app.registerExtension({
     const origCfg = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function (data) {
       const r = origCfg ? origCfg.apply(this, arguments) : undefined;
+      applyStudioNodePalette(this);
       if (this.__h3Reload) this.__h3Reload();
       return r;
     };
