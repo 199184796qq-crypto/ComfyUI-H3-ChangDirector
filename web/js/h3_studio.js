@@ -1741,8 +1741,29 @@ function buildStudio(node) {
     });
     save(); renderTimeline(); renderEditor();
   });
+  // 所有单段删除均采用两次点击确认；确认状态 8 秒后失效，避免误删。
+  const btnDelText = btnDel.textContent;
+  let delTailArmed = false;
+  let delTailTimer = null;
+  const disarmDelTail = () => {
+    delTailArmed = false;
+    clearTimeout(delTailTimer);
+    btnDel.textContent = btnDelText;
+    btnDel.style.background = "";
+    btnDel.style.borderColor = "";
+  };
   btnDel.addEventListener("click", () => {
-    if (segs.length <= 1) return;
+    if (segs.length <= 1) { status.textContent = "至少保留 1 段"; return; }
+    if (!delTailArmed) {
+      delTailArmed = true;
+      btnDel.textContent = "再点确认删除末段";
+      btnDel.style.background = "#8a2f2f";
+      btnDel.style.borderColor = "#c05555";
+      status.textContent = "请再次点击确认删除最后一段（8 秒内）";
+      delTailTimer = setTimeout(disarmDelTail, 8000);
+      return;
+    }
+    disarmDelTail();
     segs.pop();
     if (sel >= segs.length) sel = segs.length - 1;
     clearBoxSel();
@@ -1750,10 +1771,33 @@ function buildStudio(node) {
   });
   /* 删段（v2.10.16）：删除当前选中的段（-段 只能删末尾段） */
   const btnDelSel = mk("button", "h3s-btn", "删段");
-  btnDelSel.title = "删除当前选中的段（至少保留 1 段）";
+  btnDelSel.title = "删除当前选中的段（需再次点击确认；至少保留 1 段）";
+  let delSelArmed = false;
+  let delSelTarget = -1;
+  let delSelTimer = null;
+  const disarmDelSel = () => {
+    delSelArmed = false;
+    delSelTarget = -1;
+    clearTimeout(delSelTimer);
+    btnDelSel.textContent = "删段";
+    btnDelSel.style.background = "";
+    btnDelSel.style.borderColor = "";
+  };
   btnDelSel.addEventListener("click", () => {
     if (segs.length <= 1) { status.textContent = "至少保留 1 段"; return; }
+    if (!delSelArmed || delSelTarget !== sel) {
+      disarmDelSel();
+      delSelArmed = true;
+      delSelTarget = sel;
+      btnDelSel.textContent = "再点确认删除段" + (sel + 1);
+      btnDelSel.style.background = "#8a2f2f";
+      btnDelSel.style.borderColor = "#c05555";
+      status.textContent = "请再次点击确认删除段" + (sel + 1) + "（8 秒内）";
+      delSelTimer = setTimeout(disarmDelSel, 8000);
+      return;
+    }
     const removed = sel + 1;
+    disarmDelSel();
     segs.splice(sel, 1);
     if (sel >= segs.length) sel = segs.length - 1;
     clearBoxSel();
@@ -1765,7 +1809,14 @@ function buildStudio(node) {
   const btnDelBox = mk("button", "h3s-btn", "删选中");
   btnDelBox.title = "删除鼠标框选选中的段（至少保留 1 段）";
   let delBoxArmed = false;
-  const disarmDelBox = () => { delBoxArmed = false; btnDelBox.textContent = "删选中"; btnDelBox.style.background = ""; btnDelBox.style.borderColor = ""; };
+  let delBoxTimer = null;
+  const disarmDelBox = () => {
+    delBoxArmed = false;
+    clearTimeout(delBoxTimer);
+    btnDelBox.textContent = "删选中";
+    btnDelBox.style.background = "";
+    btnDelBox.style.borderColor = "";
+  };
   btnDelBox.addEventListener("click", () => {
     if (boxSel.size === 0) { status.textContent = "先在段时间轴空白处按住左键拖框选要删的段"; return; }
     if (segs.length - boxSel.size < 1) { status.textContent = "至少保留 1 段"; disarmDelBox(); return; }
@@ -1774,6 +1825,8 @@ function buildStudio(node) {
       btnDelBox.textContent = "再点确认删除 " + boxSel.size + " 段";
       btnDelBox.style.background = "#8a2f2f";
       btnDelBox.style.borderColor = "#c05555";
+      status.textContent = "请再次点击确认删除选中的 " + boxSel.size + " 段（8 秒内）";
+      delBoxTimer = setTimeout(disarmDelBox, 8000);
       return;
     }
     disarmDelBox();
