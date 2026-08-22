@@ -4875,7 +4875,16 @@ function buildStudio(node) {
       };
 
       const refVideoGrid = mk("div", "h3s-refs");
-      refVideoGrid.style.cssText = "min-height:96px;align-items:flex-start;";
+      // h3s-refs 的通用样式默认只有 64px 高，视频卡片会把“视频声音参考”
+      // 一行裁掉。视频参考区独立使用较高容器，并记住用户拖拽后的尺寸。
+      refVideoGrid.style.cssText = "height:210px;min-height:180px;align-items:flex-start;overflow:auto;resize:none;";
+      const savedRefVideoSize = s.video_ref_area_size;
+      if (savedRefVideoSize && Number.isFinite(Number(savedRefVideoSize.width))
+        && Number.isFinite(Number(savedRefVideoSize.height))) {
+        refVideoGrid.style.flex = "none";
+        refVideoGrid.style.width = Math.max(260, Math.round(Number(savedRefVideoSize.width))) + "px";
+        refVideoGrid.style.height = Math.max(180, Math.round(Number(savedRefVideoSize.height))) + "px";
+      }
       s.video_refs.forEach((name, index) => {
         const card = mk("div", null);
         card.style.cssText = "width:220px;flex:none;border:1px solid #3a5a7a;border-radius:7px;overflow:hidden;background:#101318;";
@@ -4935,6 +4944,12 @@ function buildStudio(node) {
         refVideoGrid.appendChild(mk("span", "h3s-hint", "已达 3 个参考视频上限"));
       }
       editor.appendChild(refVideoGrid);
+      // 视频参考区也有专属把手；放在该区域底部，避免和本段音频的把手混淆。
+      attachBottomBar(refVideoGrid, 260, 180, (width, height, finished) => {
+        if (!finished) return;
+        s.video_ref_area_size = { width: Math.round(width), height: Math.round(height) };
+        save();
+      });
     }
 
     /* ---- 音频可视化裁剪：波形 + 左右拖柄选区间 + 保留/删除模式 + 起始偏移 ---- */
