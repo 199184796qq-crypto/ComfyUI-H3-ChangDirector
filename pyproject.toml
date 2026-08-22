@@ -1,11 +1,11 @@
 [project]
 name = "comfyui-h3-director"
-description = "MiniMax H3 漫剧导演台：多段长视频时间轴、参考素材、段级音频、缓存重跑与尾帧接力"
+description = "MiniMax H3 长序列分镜融合台：多段长视频时间轴、参考素材、段级音频、缓存重跑与尾帧接力"
 version = "2.21.4"
 license = { text = "MIT" }
 dependencies = ["imageio-ffmpeg", "opencv-python"]
 
 [tool.comfy]
 PublisherId = ""
-DisplayName = "ComfyUI H3 漫剧导演台"
+DisplayName = "H3 长序列分镜融合台"
 Icon = ""

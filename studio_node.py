@@ -27,7 +27,7 @@ from comfy_extras.nodes_custom_sampler import Noise_RandomNoise, Guider_Basic
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo, MiniMaxH3ImageToVideo
 from comfy_extras.nodes_audio import vae_decode_audio
 
-CATEGORY = "H3导演台"
+CATEGORY = "H3 长序列分镜融合台"
 OUTPUT_DIR = folder_paths.get_output_directory()
 INPUT_DIR = folder_paths.get_input_directory()
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
@@ -823,7 +823,7 @@ class H3DirectorStudio:
     FUNCTION = "direct"
     CATEGORY = CATEGORY
     OUTPUT_NODE = True
-    DESCRIPTION = "一体式多段漫剧导演台。段间文件接力，配置未变的段自动跳过。"
+    DESCRIPTION = "一体式长序列分镜融合台。段间文件接力，配置未变的段自动跳过。"
 
     # ---------------- 单段生成 ----------------
     def _run_segment(self, seg_idx, seg_cfg, shared_refs, model, fl2va_model, clip, vae, audio_vae,
@@ -1582,4 +1582,4 @@ class H3DirectorStudio:
 
 
 NODE_CLASS_MAPPINGS = {"H3DirectorStudio": H3DirectorStudio}
-NODE_DISPLAY_NAME_MAPPINGS = {"H3DirectorStudio": "导演台·一体节点"}
+NODE_DISPLAY_NAME_MAPPINGS = {"H3DirectorStudio": "H3 长序列分镜融合台"}

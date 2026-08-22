@@ -15,7 +15,7 @@ from PIL import Image
 
 import folder_paths
 
-CATEGORY = "H3导演台"
+CATEGORY = "H3 长序列分镜融合台"
 OUTPUT_DIR = folder_paths.get_output_directory()
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 PROJECT_ROOT = os.path.join(VIDEO_DIR, "h3director")
@@ -236,6 +236,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "H3DirectorTailFrame": "导演台·上一段尾帧",
-    "H3DirectorMerge": "导演台·合并成片",
+    "H3DirectorTailFrame": "长序列分镜融合台·上一段尾帧",
+    "H3DirectorMerge": "长序列分镜融合台·合并成片",
 }

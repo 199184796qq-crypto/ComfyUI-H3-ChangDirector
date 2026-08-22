@@ -139,7 +139,7 @@ function buildPanel(root) {
   const found = Object.keys(segs).length;
 
   const head = el("div", "h3d-head");
-  head.appendChild(el("div", "h3d-title", "H3 漫剧导演台"));
+  head.appendChild(el("div", "h3d-title", "H3 长序列分镜融合台"));
   const btnRefresh = el("button", "h3d-btn", "刷新/重载面板");
   head.appendChild(btnRefresh);
   wrap.appendChild(head);
@@ -383,7 +383,7 @@ app.registerExtension({
       id: "h3Director",
       icon: "pi pi-video",
       title: "导演台",
-      tooltip: "H3 漫剧导演台",
+      tooltip: "H3 长序列分镜融合台",
       type: "custom",
       render: (el) => buildPanel(el),
     });
