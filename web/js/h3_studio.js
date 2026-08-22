@@ -5150,7 +5150,7 @@ function applyStudioNodePalette(node) {
 }
 
 app.registerExtension({
-  name: "H3Director.Studio",
+  name: "H3ContextDirector.Studio",
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (nodeData.name !== "H3DirectorStudio") return;
     const orig = nodeType.prototype.onNodeCreated;

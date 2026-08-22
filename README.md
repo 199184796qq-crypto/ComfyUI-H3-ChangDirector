@@ -1,4 +1,4 @@
-# H3 长序列分镜融合台（ComfyUI-H3-Director）
+# H3 长序列分镜融合台（ComfyUI-H3-ContextDirector）
 
 首先感谢熊猫怪兽AI日记的原创制作，这个版本只是在开源的情况下修改了部分功能，融入了长连续的功能来符合自己的创作习惯！再次感谢熊猫怪兽AI日记老师
 这是一个面向 ComfyUI 原生 MiniMax H3 工作流的中文长视频导演台。它把"多段生成、逐段验收"的漫剧制作流程整合进**一个节点**：可视化时间轴、每段独立提示词与参考图、每段配音音频、点段预览、单段重跑，段间通过尾帧文件自动接力，最终得到一组各自独立的分段成片。
@@ -49,14 +49,14 @@
 将整个文件夹放入：
 
 ```
-ComfyUI/custom_nodes/ComfyUI-H3-Director
+ComfyUI/custom_nodes/ComfyUI-H3-ContextDirector
 ```
 
 安装 Python 依赖（用 ComfyUI 自带的 python 执行）：
 
 ```bash
 # 便携版（python_embeded）
-python_embeded/python.exe -m pip install -r ComfyUI/custom_nodes/ComfyUI-H3-Director/requirements.txt
+python_embeded/python.exe -m pip install -r ComfyUI/custom_nodes/ComfyUI-H3-ContextDirector/requirements.txt
 
 # 国内镜像加速
 # -i https://pypi.tuna.tsinghua.edu.cn/simple
@@ -183,7 +183,7 @@ H3 漫剧导演台·一体节点
 - 点「**测试连接**」会保存当前设置并发送一次最短测试；只有点击测试或生成时才联网。
 - 写一句创意或大白话分镜，选择「智能生成 / 编写模式」，点「**生成**」，结果会写回当前段提示词框。
 - 选择支持图片输入的模型时，当前段参考图、续接尾帧和参考视频关键帧会随请求发送，帮助模型按素材写提示词。
-- API Key 只保存在本机 `ComfyUI/user/ComfyUI-H3-Director/api_config.json`；前端接口只查询是否已配置，Key 不写入工作流、节点属性、localStorage 或日志。
+- API Key 只保存在本机 `ComfyUI/user/ComfyUI-H3-ContextDirector/api_config.json`；前端接口只查询是否已配置，Key 不写入工作流、节点属性、localStorage 或日志。
 - Base URL 通常填写到 `/v1`，插件会自动调用 `/chat/completions`；如果服务商给的是完整 `/chat/completions` 地址，也可以直接填写。
 
 ## 段级音频

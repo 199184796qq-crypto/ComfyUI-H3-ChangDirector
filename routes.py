@@ -32,23 +32,34 @@ MAX_VIDEO_UPLOAD = 2 * 1024 * 1024 * 1024
 MAX_CONTEXT_VIDEO_UPLOAD = 200 * 1024 * 1024
 MAX_CONTEXT_LATENT_UPLOAD = 2 * 1024 * 1024 * 1024
 
-API_CONFIG_DIR = os.path.join(folder_paths.get_user_directory(), "ComfyUI-H3-Director")
+API_CONFIG_DIR = os.path.join(folder_paths.get_user_directory(), "ComfyUI-H3-ContextDirector")
 API_CONFIG_FILE = os.path.join(API_CONFIG_DIR, "api_config.json")
+# 从旧目录自动读取并迁移，重命名节点后无需重新填写 API 配置。
+LEGACY_API_CONFIG_FILE = os.path.join(
+    folder_paths.get_user_directory(), "ComfyUI-H3-Director", "api_config.json")
 DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_API_MODEL = "gpt-5"
 
 
 def _load_api_config():
     config = {"base_url": DEFAULT_API_BASE_URL, "model": DEFAULT_API_MODEL, "api_key": ""}
-    try:
-        with open(API_CONFIG_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        if isinstance(saved, dict):
+    for config_file in (API_CONFIG_FILE, LEGACY_API_CONFIG_FILE):
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if not isinstance(saved, dict):
+                continue
             for key in config:
                 if isinstance(saved.get(key), str):
                     config[key] = saved[key].strip()
-    except (OSError, ValueError, TypeError):
-        pass
+            if config_file == LEGACY_API_CONFIG_FILE:
+                try:
+                    _save_api_config(config)
+                except OSError:
+                    pass
+            break
+        except (OSError, ValueError, TypeError):
+            continue
     return config
 
 

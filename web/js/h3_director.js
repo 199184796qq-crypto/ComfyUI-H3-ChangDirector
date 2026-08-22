@@ -377,7 +377,7 @@ function buildPanel(root) {
 /* ---------------- 注册扩展 ---------------- */
 
 app.registerExtension({
-  name: "H3Director.Panel",
+  name: "H3ContextDirector.Panel",
   async setup() {
     app.extensionManager.registerSidebarTab({
       id: "h3Director",
