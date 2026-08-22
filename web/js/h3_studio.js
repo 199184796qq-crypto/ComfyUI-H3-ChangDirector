@@ -985,13 +985,14 @@ function mk(tag, cls, text) {
 
 /* 区域下方显式拖拽条：一条全宽可见横条（≡ 按住拖动），上下调高、左右调宽。
    比角标/边缘条醒目，不会被滚动条遮挡，也不依赖浏览器原生 resize。 */
-function attachBottomBar(el, minW = 80, minH = 40, onResize = null) {
+function attachBottomBar(el, minW = 80, minH = 40, onResize = null, afterEl = null) {
   const bar = document.createElement("div");
   bar.style.cssText = "display:flex;align-items:center;justify-content:center;height:16px;flex:none;"
     + "cursor:ns-resize;background:#23282f;border:1px solid #3a3f46;border-radius:5px;"
     + "color:#8ab4f8;font-size:10px;user-select:none;letter-spacing:1px;margin-top:2px;";
   bar.textContent = "≡ 按住拖动：上下调高 · 左右调宽";
-  el.parentNode.insertBefore(bar, el.nextSibling);
+  const anchor = afterEl && afterEl.parentNode === el.parentNode ? afterEl : el;
+  anchor.parentNode.insertBefore(bar, anchor.nextSibling);
   bar.addEventListener("pointerdown", (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
@@ -4576,14 +4577,6 @@ function buildStudio(node) {
       vrefs.appendChild(mk("span", "h3s-hint", "已达 3 路上限"));
     }
     editor.appendChild(vrefs);
-    attachBottomBar(vrefs, 140, 64, (width, height, finished) => {
-      s.voice_area_width = Math.round(width);
-      s.voice_area_height = Math.round(height);
-      if (finished) {
-        s.prompt = ta.value;
-        save();
-      }
-    });
     if (vbase) {
       editor.appendChild(mk("div", "h3s-hint", "注：本段音频的「参考驱动」已占用 <Audio 1>，音色槽编号从 A2 起"));
     }
@@ -4716,6 +4709,15 @@ function buildStudio(node) {
       }).catch(() => { /* 旧后端无此路由时下拉仅占位，重启 ComfyUI 后可用 */ });
     }
     editor.appendChild(audioRow);
+    // 视觉上放在“本段音频”行之后；实际继续调整参考音色区，旧的尺寸记忆保持有效。
+    attachBottomBar(vrefs, 140, 64, (width, height, finished) => {
+      s.voice_area_width = Math.round(width);
+      s.voice_area_height = Math.round(height);
+      if (finished) {
+        s.prompt = ta.value;
+        save();
+      }
+    }, audioRow);
 
     // 云端无磁盘 latent 时的 Motion Context 视频续接。放在本段音频正下方，
     // 让用户明确知道：上传视频的末尾画面与音轨会一并进入 context_frames/context_audio。
@@ -4786,6 +4788,12 @@ function buildStudio(node) {
         const videoBox = mk("div", null);
         videoBox.style.cssText = "position:relative;width:360px;height:203px;flex:none;border-radius:8px;"
           + "overflow:hidden;background:#000;border:1px solid #3a5a7a;";
+        const savedContextVideoSize = s.motion_context_video_box_size;
+        if (savedContextVideoSize && Number.isFinite(Number(savedContextVideoSize.width))
+          && Number.isFinite(Number(savedContextVideoSize.height))) {
+          videoBox.style.width = Math.max(240, Math.round(Number(savedContextVideoSize.width))) + "px";
+          videoBox.style.height = Math.max(135, Math.round(Number(savedContextVideoSize.height))) + "px";
+        }
         const player = document.createElement("video");
         player.src = api.apiURL("/view?filename=" + encodeURIComponent(curContextVideo) + "&type=input");
         player.preload = "metadata";
@@ -4809,6 +4817,11 @@ function buildStudio(node) {
         reset.addEventListener("click", () => { player.pause(); player.currentTime = 0; });
         controls.append(play, pause, reset);
         editor.appendChild(controls);
+        attachBottomBar(videoBox, 240, 135, (width, height, finished) => {
+          if (!finished) return;
+          s.motion_context_video_box_size = { width: Math.round(width), height: Math.round(height) };
+          save();
+        }, controls);
       }
     }
 
