@@ -5,6 +5,8 @@
 
 当前插件版本为 **2.21.4**。最低支持 ComfyUI **0.30.0**，推荐 **0.31.1 或更新版本**。本插件不包含模型，也没有复制 H3 的采样实现；请先确认 ComfyUI 已带有 `MiniMax H3 Reference To Video` 和 `MiniMax H3 Image To Video` 原生节点。
 
+**云平台 Motion Context 续接：** 默认“latent 延续：本地自动续接”完全保持原有逻辑。若平台不能保存 H3 latent，可在创作界面为第 2 段及以后勾选 `MotionContext`，将来源改为“视频延续”，并在本段音频下方上传上一段成片；文件最大 **200 MB**、时长必须**小于 15 秒**、且需要包含音轨。运行时会从该视频末尾读取画面帧和音频，分别作为 Motion Context 的 `context_frames` 与 `context_audio`，不读取也不保存 latent。也可选择“上传 latent”，导入由 H3 Motion Context Save Latent 创建的 `.safetensors` 文件。
+
 2.18.0 新增内嵌 `ComfyUI-H3-Motion-Context` 接力：节点级全局设置区提供上下文保存目录、加载目录、画面/音频上下文长度和音频尾部匹配参数；每个视频段提供 `MotionContext` 开关。第1段始终绕过加载，后续启用段加载上一段固定 clip 槽位。无论段级开关是否启用，每个实际生成段都会保存自己的 H3 AV latent，文件名沿用 Motion Context 的 `clip_00001.safetensors` 固定编号规则。
 
 2.21.4 在“参考音色/配音”文件区域下方新增双向尺寸把手：上下调高、左右调宽；每一段分别保存自己的音频区域尺寸。2.21.3 在每个参考音色卡片下方新增播放/暂停按钮。试听使用共享播放器，播放新音色会自动停止上一条，切换段、删除音色或移除节点时也会停止播放。

@@ -26,9 +26,11 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, web
 OUTPUT_DIR = folder_paths.get_output_directory()
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 PROJECT_ROOT = os.path.join(VIDEO_DIR, "h3director")
-BACKEND_VERSION = "2.21.4"  # 前端 JS 据此判断后端代码是否过旧（提示用户重启 ComfyUI）
+BACKEND_VERSION = "2.22.0"  # 前端 JS 据此判断后端代码是否过旧（提示用户重启 ComfyUI）
 MAX_AUDIO_UPLOAD = 100 * 1024 * 1024
 MAX_VIDEO_UPLOAD = 2 * 1024 * 1024 * 1024
+MAX_CONTEXT_VIDEO_UPLOAD = 200 * 1024 * 1024
+MAX_CONTEXT_LATENT_UPLOAD = 2 * 1024 * 1024 * 1024
 
 API_CONFIG_DIR = os.path.join(folder_paths.get_user_directory(), "ComfyUI-H3-Director")
 API_CONFIG_FILE = os.path.join(API_CONFIG_DIR, "api_config.json")
@@ -382,6 +384,28 @@ def _write_upload(upload, path, max_bytes):
         raise
 
 
+def _context_video_duration(path):
+    """Read duration without depending on browser metadata (cloud-safe validation)."""
+    try:
+        import imageio_ffmpeg
+        gen = imageio_ffmpeg.read_frames(path, pix_fmt="rgb24")
+        try:
+            meta = next(gen)
+        finally:
+            try:
+                gen.close()
+            except Exception:
+                pass
+        duration = float(meta.get("duration") or 0)
+    except Exception as exc:
+        raise ValueError("无法读取视频时长，请上传可正常播放的视频") from exc
+    if duration <= 0:
+        raise ValueError("无法识别视频时长，请换一个视频文件")
+    if duration >= 15:
+        raise ValueError("上下文视频时长必须小于 15 秒（当前 %.2f 秒）" % duration)
+    return duration
+
+
 def register_routes():
     from server import PromptServer
     app = PromptServer.instance
@@ -563,6 +587,58 @@ def register_routes():
         name = os.path.basename(dst)
         try:
             await asyncio.to_thread(_write_upload, up, dst, MAX_VIDEO_UPLOAD)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=413)
+        return web.json_response({"ok": True, "name": name, "label": (up.filename or name)})
+
+    @app.routes.post("/h3director/upload_context_video")
+    async def upload_context_video(request):
+        """Upload a previous clip for Motion Context's frame+audio path.
+
+        This is deliberately separate from generic reference-video upload:
+        cloud uploads stay bounded and the strict <15s rule is verified by
+        the server rather than trusting the browser's metadata.
+        """
+        data = await request.post()
+        up = data.get("video")
+        if up is None or not getattr(up, "file", None):
+            return web.json_response({"error": "缺少上下文视频文件"}, status=400)
+        ext = os.path.splitext(up.filename or "")[1].lower()
+        if ext not in (".mp4", ".webm", ".mov", ".mkv", ".avi"):
+            return web.json_response({"error": "不支持的视频格式: " + (ext or "无扩展名")}, status=400)
+        fd, dst = tempfile.mkstemp(prefix="h3context_video_", suffix=ext,
+                                   dir=folder_paths.get_input_directory())
+        os.close(fd)
+        name = os.path.basename(dst)
+        try:
+            await asyncio.to_thread(_write_upload, up, dst, MAX_CONTEXT_VIDEO_UPLOAD)
+            duration = await asyncio.to_thread(_context_video_duration, dst)
+        except ValueError as e:
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
+            return web.json_response({"error": str(e)}, status=413)
+        return web.json_response({"ok": True, "name": name,
+                                  "label": (up.filename or name),
+                                  "duration": round(duration, 2)})
+
+    @app.routes.post("/h3director/upload_context_latent")
+    async def upload_context_latent(request):
+        """Upload an AV latent previously produced by H3 Motion Context Save Latent."""
+        data = await request.post()
+        up = data.get("latent")
+        if up is None or not getattr(up, "file", None):
+            return web.json_response({"error": "缺少 Motion Context latent 文件"}, status=400)
+        ext = os.path.splitext(up.filename or "")[1].lower()
+        if ext != ".safetensors":
+            return web.json_response({"error": "latent 必须是 .safetensors 文件"}, status=400)
+        fd, dst = tempfile.mkstemp(prefix="h3context_latent_", suffix=ext,
+                                   dir=folder_paths.get_input_directory())
+        os.close(fd)
+        name = os.path.basename(dst)
+        try:
+            await asyncio.to_thread(_write_upload, up, dst, MAX_CONTEXT_LATENT_UPLOAD)
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=413)
         return web.json_response({"ok": True, "name": name, "label": (up.filename or name)})

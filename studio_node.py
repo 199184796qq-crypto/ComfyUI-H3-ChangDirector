@@ -33,17 +33,24 @@ INPUT_DIR = folder_paths.get_input_directory()
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 PROJECT_ROOT = os.path.join(VIDEO_DIR, "h3director")
 FPS = 24
-CACHE_SCHEMA = 6  # v2.22：加入段级生成模式，模式切换时旧段缓存必须失效
+CACHE_SCHEMA = 7  # v2.23：加入 Motion Context 的本地 latent / 上传 latent / 上传视频来源
 
 # 段级生成模式。multi_ref 保持旧版 Ref2VA 多参考图行为；其余模式走
 # MiniMaxH3ImageToVideo，并由本段 refs 的顺序提供首帧/尾帧。
 GENERATION_MODES = {"multi_ref", "text_to_video", "first_frame", "first_last_frame", "last_frame"}
+MOTION_CONTEXT_SOURCES = {"local_latent", "upload_latent", "video"}
 
 
 def _generation_mode(seg_cfg):
     """读取兼容旧工作流的段级生成模式。旧段一律保持多参生视频。"""
     value = str((seg_cfg or {}).get("generation_mode") or "multi_ref").strip()
     return value if value in GENERATION_MODES else "multi_ref"
+
+
+def _motion_context_source(seg_cfg):
+    """读取 Motion Context 来源；旧工作流一律保留本地自动 latent 续接。"""
+    value = str((seg_cfg or {}).get("motion_context_source") or "local_latent").strip()
+    return value if value in MOTION_CONTEXT_SOURCES else "local_latent"
 
 
 def _log(msg):
@@ -469,6 +476,42 @@ def _load_video_for_ref(path, ffmpeg, seg_cfg=None):
     return video, audio
 
 
+def _load_video_for_motion_context(path, ffmpeg, max_frames=56):
+    """Decode an uploaded previous clip for Motion Context's pixel/audio path.
+
+    Only the tail can be pinned by H3 Motion Context, so keep a rolling tail
+    instead of materialising a full 15-second 4K clip in RAM.  Unlike the
+    generic reference-video loader this must not pad frames: duplicated end
+    frames would replace the actual motion at the seam.
+    """
+    import imageio_ffmpeg
+    from collections import deque
+
+    max_frames = max(1, min(56, int(max_frames or 56)))
+    gen = imageio_ffmpeg.read_frames(
+        path, pix_fmt="rgb24",
+        output_params=["-vf", "fps=%d,scale='if(gte(iw,ih),min(iw,1280),-2)':'if(gte(iw,ih),-2,min(ih,1280))'" % FPS])
+    meta = next(gen)
+    vw, vh = meta["size"]
+    tail = deque(maxlen=max_frames)
+    try:
+        for buf in gen:
+            tail.append(np.frombuffer(buf, np.uint8).reshape(vh, vw, 3).copy())
+    finally:
+        try:
+            gen.close()
+        except Exception:
+            pass
+    if not tail:
+        raise RuntimeError("上下文视频没有可读取的画面帧: " + path)
+    frames = torch.from_numpy(np.stack(tuple(tail))).float() / 255.0
+    try:
+        audio = _load_audio_for_ref(path, {}, ffmpeg)
+    except Exception as exc:
+        raise RuntimeError("上下文视频没有可用音轨；请上传带音频的视频: " + path) from exc
+    return frames, audio
+
+
 def _load_input_image(name):
     img = Image.open(_resolve_input(name)).convert("RGB")
     arr = np.asarray(img).astype(np.float32) / 255.0
@@ -832,7 +875,7 @@ class H3DirectorStudio:
                       primary_model_kind="unknown", context_save_dir="h3_context",
                       context_load_dir="h3_context", context_length="22",
                       audio_context_length=24, context_match_tail=True,
-                      external_sigmas=None):
+                      external_sigmas=None, save_context_latent=True):
         # 0) 计算本段时长与帧数（缺失时用节点默认时长），帧数对齐 ≡5 (mod 17)
         # 段级分辨率覆盖（v2.8）：每段视频尺寸可不同；留空=跟随节点宽高
         _wo = int(seg_cfg.get("width") or 0)
@@ -1133,19 +1176,50 @@ class H3DirectorStudio:
         # Motion Context：第一段永远没有上段 clip，因此强制绕过；后续段只有
         # 段级开关开启时才加载上一固定槽位并注入画面+声音上下文。
         motion_enabled = seg_idx > 1 and seg_cfg.get("motion_context", True) is not False
+        motion_source = _motion_context_source(seg_cfg)
         trim_frames = 0
         MotionClass = TrimClass = SaveClass = LoadClass = None
         if motion_enabled:
             MotionClass, TrimClass, SaveClass, LoadClass = _motion_context_classes()
-            previous_latent = LoadClass().load(context_load_dir, clip_index=seg_idx - 1)[0]
-            cond, trim_frames = MotionClass().apply(
-                cond, vae, latent, str(context_length),
-                audio_context_length=int(audio_context_length),
-                context_latent=previous_latent,
-            )
-            del previous_latent
-            _log("[H3导演台] 段%d MotionContext 已启用：加载 clip %d，画面 %s 帧，音频 %d 帧" % (
-                seg_idx, seg_idx - 1, context_length, int(audio_context_length)))
+            if motion_source == "video":
+                video_name = str(seg_cfg.get("motion_context_video") or "").strip()
+                if not video_name:
+                    raise ValueError("[H3导演台] 段%d选择了 MotionContext 视频延续，但尚未上传上下文视频。" % seg_idx)
+                video_path = _resolve_input(video_name)
+                if not os.path.isfile(video_path):
+                    raise ValueError("[H3导演台] 段%d的上下文视频不存在: %s" % (seg_idx, video_name))
+                context_frames, context_audio = _load_video_for_motion_context(
+                    video_path, ffmpeg, max_frames=int(context_length))
+                cond, trim_frames = MotionClass().apply(
+                    cond, vae, latent, str(context_length),
+                    audio_context_length=int(audio_context_length),
+                    context_frames=context_frames, audio_vae=audio_vae,
+                    context_audio=context_audio,
+                )
+                del context_frames, context_audio
+                _log("[H3导演台] 段%d MotionContext 视频延续：%s（画面 %s 帧，音频 %d 帧；未加载 latent）" % (
+                    seg_idx, os.path.basename(video_path), context_length, int(audio_context_length)))
+            else:
+                if motion_source == "upload_latent":
+                    latent_name = str(seg_cfg.get("motion_context_latent") or "").strip()
+                    if not latent_name:
+                        raise ValueError("[H3导演台] 段%d选择了上传 latent 延续，但尚未上传 H3 Motion Context latent。" % seg_idx)
+                    latent_path = _resolve_input(latent_name)
+                    if not os.path.isfile(latent_path):
+                        raise ValueError("[H3导演台] 段%d的上传 latent 不存在: %s" % (seg_idx, latent_name))
+                    previous_latent = LoadClass().load(latent_path, clip_index=0)[0]
+                    source_note = "上传 latent " + os.path.basename(latent_path)
+                else:
+                    previous_latent = LoadClass().load(context_load_dir, clip_index=seg_idx - 1)[0]
+                    source_note = "本地 clip %d" % (seg_idx - 1)
+                cond, trim_frames = MotionClass().apply(
+                    cond, vae, latent, str(context_length),
+                    audio_context_length=int(audio_context_length),
+                    context_latent=previous_latent,
+                )
+                del previous_latent
+                _log("[H3导演台] 段%d MotionContext 已启用：%s，画面 %s 帧，音频 %d 帧" % (
+                    seg_idx, source_note, context_length, int(audio_context_length)))
         elif seg_idx == 1:
             _log("[H3导演台] 段1 MotionContext 强制绕过（没有上一段 clip）")
         else:
@@ -1183,12 +1257,17 @@ class H3DirectorStudio:
         # 无论 MotionContext 段级开关是否开启，每个已生成段都保存 H3 AV latent。
         # clip_index 使用真实段号；重跑同一段覆盖自己的固定槽位，并按原节点
         # 业务逻辑额外写入 backup 归档。
-        if SaveClass is None:
-            MotionClass, TrimClass, SaveClass, LoadClass = _motion_context_classes()
-        saved_context_path = SaveClass().save(
-            {"samples": samples}, _context_save_prefix(context_save_dir),
-            clip_index=seg_idx, pair_number=0, noise=noise)[0]
-        _log("[H3导演台] 段%d 上下文 clip 已保存：%s" % (seg_idx, saved_context_path))
+        # 是否保存由“下一段”是否选择本地 latent 自动续接决定。这样云平台在
+        # 视频延续链路中连首段也不会尝试写 nested latent。
+        if save_context_latent:
+            if SaveClass is None:
+                MotionClass, TrimClass, SaveClass, LoadClass = _motion_context_classes()
+            saved_context_path = SaveClass().save(
+                {"samples": samples}, _context_save_prefix(context_save_dir),
+                clip_index=seg_idx, pair_number=0, noise=noise)[0]
+            _log("[H3导演台] 段%d 上下文 clip 已保存：%s" % (seg_idx, saved_context_path))
+        else:
+            _log("[H3导演台] 段%d 后续不需要本地 latent：跳过 Motion Context latent 保存" % seg_idx)
 
         with torch.inference_mode():
             # H3 的 AV latent 是嵌套张量（视频+音频打包），视频解码前需解包取 [0]
@@ -1419,6 +1498,17 @@ class H3DirectorStudio:
                 report.append("段%d: 跳过（未启用）" % seg_idx)
                 continue
 
+            # 当前段的 latent 只有在紧接的下一段选择“本地自动 latent 续接”时才需要保存。
+            # 上传 latent / 视频延续都自带上一段上下文，云平台可因此完全绕开磁盘 latent。
+            next_cfg = segments[k + 1] if k + 1 < len(segments) else None
+            save_context_latent = bool(
+                next_cfg and next_cfg.get("enabled", True)
+                and _generation_mode(next_cfg) == "multi_ref"
+                and next_cfg.get("motion_context", True) is not False
+                and _motion_context_source(next_cfg) == "local_latent"
+            )
+            motion_source = _motion_context_source(seg_cfg)
+
             run_cfg = {
                 "cache_schema": CACHE_SCHEMA,
                 "prompt": (global_prompt or "") + "\n\n" + seg_cfg.get("prompt", ""), "seed": seg_cfg.get("seed", 0),
@@ -1429,6 +1519,10 @@ class H3DirectorStudio:
                 "inherit_shared": seg_cfg.get("inherit_shared", True),
                 "use_tail": seg_cfg.get("use_tail", True),
                 "motion_context": bool(seg_idx > 1 and seg_cfg.get("motion_context", True) is not False),
+                "motion_context_source": motion_source,
+                "motion_context_latent": _input_signature(seg_cfg.get("motion_context_latent")),
+                "motion_context_video": _input_signature(seg_cfg.get("motion_context_video")),
+                "save_context_latent": save_context_latent,
                 "tail_mode": tail_mode,
                 "tail": (_path_signature(_seg_tail(seg_idx - 1, mode, project_id))
                          if seg_cfg.get("use_tail", True) and seg_idx > 1 else None),
@@ -1466,10 +1560,13 @@ class H3DirectorStudio:
                 "context_length": str(MotionContext画面帧数),
                 "audio_context_length": int(MotionContext音频帧数),
                 "context_match_tail": bool(MotionContext匹配尾部),
-                "context_source": (_path_signature(_context_slot_path(上下文加载目录, seg_idx - 1))
-                                   if seg_idx > 1 and seg_cfg.get("motion_context", True) is not False
-                                   and _context_slot_path(上下文加载目录, seg_idx - 1)
-                                   else None),
+                "context_source": (
+                    _input_signature(seg_cfg.get("motion_context_video")) if motion_source == "video"
+                    else _input_signature(seg_cfg.get("motion_context_latent")) if motion_source == "upload_latent"
+                    else (_path_signature(_context_slot_path(上下文加载目录, seg_idx - 1))
+                          if seg_idx > 1 and seg_cfg.get("motion_context", True) is not False
+                          and _context_slot_path(上下文加载目录, seg_idx - 1) else None)
+                ),
             }
             h = _config_hash(run_cfg)
             meta_ok = False
@@ -1488,7 +1585,7 @@ class H3DirectorStudio:
             # 每个视频段都必须有与段号对应的 Motion Context clip。旧缓存只有
             # mp4/json 而没有 latent 时，自动重跑该段补齐固定槽位。
             context_slot = _context_slot_path(上下文保存目录, seg_idx)
-            if context_slot is None:
+            if save_context_latent and context_slot is None:
                 meta_ok = False
 
             generated_now = False
@@ -1506,7 +1603,8 @@ class H3DirectorStudio:
                     context_length=MotionContext画面帧数,
                     audio_context_length=MotionContext音频帧数,
                     context_match_tail=MotionContext匹配尾部,
-                    external_sigmas=外部SIGMAS)
+                    external_sigmas=外部SIGMAS,
+                    save_context_latent=save_context_latent)
                 generated_now = True
                 meta_data = {
                     "schema": CACHE_SCHEMA,
@@ -1515,9 +1613,11 @@ class H3DirectorStudio:
                 }
                 ran.append(seg_idx)
                 mc_note = "首段绕过" if seg_idx == 1 else (
-                    "启用" if seg_cfg.get("motion_context", True) is not False else "关闭")
-                report.append("段%d: 已生成 -> %s | MotionContext %s | 已保存 clip %d" % (
-                    seg_idx, os.path.basename(video_path), mc_note, seg_idx))
+                    {"local_latent": "本地 latent", "upload_latent": "上传 latent", "video": "视频延续"}.get(motion_source)
+                    if seg_cfg.get("motion_context", True) is not False else "关闭")
+                save_note = "已保存 clip %d" % seg_idx if save_context_latent else "不保存 latent"
+                report.append("段%d: 已生成 -> %s | MotionContext %s | %s" % (
+                    seg_idx, os.path.basename(video_path), mc_note, save_note))
             if os.path.exists(video_path):
                 try:
                     exported_path, export_sig, copied = _export_segment_video(

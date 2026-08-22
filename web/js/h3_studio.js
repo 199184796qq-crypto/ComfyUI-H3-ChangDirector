@@ -4,7 +4,7 @@ import { H3_TEXT_TEMPLATES } from "./h3_templates.js";
 
 /* 前端版本号：与 routes.py 的 BACKEND_VERSION 对应。
    status 接口返回的后端版本若与此不一致（用户改了代码但没重启/没强刷），状态栏红字提示。 */
-const H3S_VERSION = "2.21.4";
+const H3S_VERSION = "2.22.0";
 const activeProjectIds = new Map();
 
 function newProjectId() {
@@ -194,6 +194,7 @@ function defaultSegs() {
       generation_mode: "multi_ref",
       use_tail: false,
       motion_context: i > 0,
+      motion_context_source: "local_latent",
       enabled: true,
       force: false,
     });
@@ -1260,6 +1261,9 @@ function buildStudio(node) {
         seg.use_tail = false;
         seg.motion_context = false;
       } else if (seg.motion_context === true) {
+        if (!["local_latent", "upload_latent", "video"].includes(seg.motion_context_source)) {
+          seg.motion_context_source = "local_latent";
+        }
         seg.motion_context = true;
         seg.use_tail = false;
       } else {
@@ -3160,6 +3164,9 @@ function buildStudio(node) {
     if (!s) return;
     const generationMode = s.generation_mode || "multi_ref";
     if (!s.generation_mode) s.generation_mode = generationMode;
+    const motionContextSource = ["local_latent", "upload_latent", "video"].includes(s.motion_context_source)
+      ? s.motion_context_source : "local_latent";
+    if (!s.motion_context_source) s.motion_context_source = motionContextSource;
     const externalTextInput = (node.inputs || []).find((input) => input.name === "外部文本");
     const externalTextConnected = !!(externalTextInput && externalTextInput.link != null);
     if (externalTextConnected) {
@@ -3666,6 +3673,75 @@ function buildStudio(node) {
     row.appendChild(motionLab);
 
     editor.appendChild(row);
+
+    // Motion Context 的来源：默认保持原有“本地自动 latent”逻辑；云平台不能写 latent
+    // 时可改为上传此前保存的 latent，或直接上传上一段带音轨的视频。
+    if (sel >= 1 && generationMode === "multi_ref" && s.motion_context === true) {
+      const sourceRow = mk("div", "h3s-row");
+      sourceRow.appendChild(mk("span", "h3s-hint", "Motion Context 来源："));
+      const sourceSel = document.createElement("select");
+      [
+        ["local_latent", "latent 延续：本地自动续接"],
+        ["upload_latent", "latent 延续：上传 latent"],
+        ["video", "视频延续：上传上一段视频"],
+      ].forEach(([value, label]) => {
+        const opt = document.createElement("option");
+        opt.value = value; opt.textContent = label; sourceSel.appendChild(opt);
+      });
+      sourceSel.value = motionContextSource;
+      sourceSel.title = "本地自动续接保持旧逻辑；上传 latent 使用 H3 Motion Context 保存的 .safetensors；视频延续不读取或保存 latent，而是把上传视频的末尾画面和音频作为上下文。";
+      sourceSel.addEventListener("change", () => {
+        s.motion_context = true;
+        s.use_tail = false;
+        s.motion_context_source = sourceSel.value;
+        save(); renderEditor();
+      });
+      sourceRow.appendChild(sourceSel);
+
+      if (motionContextSource === "upload_latent") {
+        sourceRow.appendChild(mk("span", "h3s-hint", s.motion_context_latent
+          ? "已选：" + (s.motion_context_latent_label || s.motion_context_latent)
+          : "未上传 .safetensors"));
+        const upLatent = mk("button", "h3s-btn", "+上传 latent");
+        upLatent.title = "仅支持 H3 Motion Context Save Latent 生成的 .safetensors 文件";
+        upLatent.addEventListener("click", () => {
+          const inp = document.createElement("input");
+          inp.type = "file"; inp.accept = ".safetensors"; inp.style.display = "none";
+          document.body.appendChild(inp);
+          inp.addEventListener("change", async () => {
+            try {
+              const file = inp.files && inp.files[0];
+              if (!file) return;
+              status.textContent = "正在上传 Motion Context latent…";
+              const fd = new FormData(); fd.append("latent", file, file.name);
+              const resp = await api.fetchApi("/h3director/upload_context_latent", { method: "POST", body: fd });
+              const data = await resp.json();
+              if (!(data.ok && data.name)) throw new Error(data.error || ("HTTP " + resp.status));
+              s.motion_context_latent = data.name;
+              s.motion_context_latent_label = data.label || file.name;
+              save(); renderEditor();
+              status.textContent = "Motion Context latent 已上传";
+            } catch (e) { status.textContent = "latent 上传失败: " + e.message; }
+            finally { inp.remove(); }
+          });
+          inp.click();
+        });
+        sourceRow.appendChild(upLatent);
+        if (s.motion_context_latent) {
+          const rmLatent = mk("button", "h3s-btn", "×");
+          rmLatent.title = "移除已选 latent";
+          rmLatent.addEventListener("click", () => {
+            s.motion_context_latent = null; s.motion_context_latent_label = null;
+            save(); renderEditor();
+          });
+          sourceRow.appendChild(rmLatent);
+        }
+      }
+      sourceRow.appendChild(mk("span", "h3s-hint", motionContextSource === "video"
+        ? "视频上传区在本段音频下方"
+        : motionContextSource === "local_latent" ? "沿用原有本地 clip 自动续接" : "运行时校验 AV latent 格式"));
+      editor.appendChild(sourceRow);
+    }
 
     /* 段级生成模式：端点模式直接映射到原生 MiniMaxH3ImageToVideo。
        参考图区前两张图的顺序固定为首帧、尾帧，避免依赖提示词猜测。 */
@@ -4640,6 +4716,61 @@ function buildStudio(node) {
       }).catch(() => { /* 旧后端无此路由时下拉仅占位，重启 ComfyUI 后可用 */ });
     }
     editor.appendChild(audioRow);
+
+    // 云端无磁盘 latent 时的 Motion Context 视频续接。放在本段音频正下方，
+    // 让用户明确知道：上传视频的末尾画面与音轨会一并进入 context_frames/context_audio。
+    if (sel >= 1 && generationMode === "multi_ref" && s.motion_context === true
+      && motionContextSource === "video") {
+      const contextVideoRow = mk("div", "h3s-row");
+      contextVideoRow.appendChild(mk("span", "h3s-hint", "上下文视频："));
+      if (s.motion_context_video) {
+        contextVideoRow.appendChild(mk("span", "h3s-hint",
+          "🎬 " + (s.motion_context_video_label || s.motion_context_video)
+          + (s.motion_context_video_duration ? "（" + Number(s.motion_context_video_duration).toFixed(2) + "s）" : "")));
+        const rmVideo = mk("button", "h3s-btn", "×");
+        rmVideo.title = "移除上下文视频";
+        rmVideo.addEventListener("click", () => {
+          s.motion_context_video = null;
+          s.motion_context_video_label = null;
+          s.motion_context_video_duration = null;
+          save(); renderEditor();
+        });
+        contextVideoRow.appendChild(rmVideo);
+      } else {
+        contextVideoRow.appendChild(mk("span", "h3s-hint", "未上传"));
+      }
+      const upVideo = mk("button", "h3s-btn", "+上传视频");
+      upVideo.title = "只接受 mp4/webm/mov/mkv/avi；最大 200 MB，时长必须小于 15 秒，且必须带音轨";
+      upVideo.addEventListener("click", () => {
+        const inp = document.createElement("input");
+        inp.type = "file";
+        inp.accept = "video/mp4,video/webm,video/quicktime,video/x-matroska,video/x-msvideo";
+        inp.style.display = "none";
+        document.body.appendChild(inp);
+        inp.addEventListener("change", async () => {
+          try {
+            const file = inp.files && inp.files[0];
+            if (!file) return;
+            if (file.size > 200 * 1024 * 1024) throw new Error("视频不能大于 200 MB");
+            status.textContent = "正在上传上下文视频并校验时长…";
+            const fd = new FormData(); fd.append("video", file, file.name);
+            const resp = await api.fetchApi("/h3director/upload_context_video", { method: "POST", body: fd });
+            const data = await resp.json();
+            if (!(data.ok && data.name)) throw new Error(data.error || ("HTTP " + resp.status));
+            s.motion_context_video = data.name;
+            s.motion_context_video_label = data.label || file.name;
+            s.motion_context_video_duration = data.duration || null;
+            save(); renderEditor();
+            status.textContent = "上下文视频已上传：将用末尾画面帧和音频续接，不读取 latent";
+          } catch (e) { status.textContent = "上下文视频上传失败: " + e.message; }
+          finally { inp.remove(); }
+        });
+        inp.click();
+      });
+      contextVideoRow.appendChild(upVideo);
+      contextVideoRow.appendChild(mk("span", "h3s-hint", "最大 200 MB｜时长 < 15 秒｜需含音轨"));
+      editor.appendChild(contextVideoRow);
+    }
 
     /* ---- 音频可视化裁剪：波形 + 左右拖柄选区间 + 保留/删除模式 + 起始偏移 ---- */
     if (s.audio) {
