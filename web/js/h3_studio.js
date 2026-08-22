@@ -4721,27 +4721,20 @@ function buildStudio(node) {
     // 让用户明确知道：上传视频的末尾画面与音轨会一并进入 context_frames/context_audio。
     if (sel >= 1 && generationMode === "multi_ref" && s.motion_context === true
       && motionContextSource === "video") {
-      const contextVideoRow = mk("div", "h3s-row");
-      contextVideoRow.appendChild(mk("span", "h3s-hint", "上下文视频："));
-      if (s.motion_context_video) {
-        contextVideoRow.appendChild(mk("span", "h3s-hint",
-          "🎬 " + (s.motion_context_video_label || s.motion_context_video)
-          + (s.motion_context_video_duration ? "（" + Number(s.motion_context_video_duration).toFixed(2) + "s）" : "")));
-        const rmVideo = mk("button", "h3s-btn", "×");
-        rmVideo.title = "移除上下文视频";
-        rmVideo.addEventListener("click", () => {
-          s.motion_context_video = null;
-          s.motion_context_video_label = null;
-          s.motion_context_video_duration = null;
-          save(); renderEditor();
-        });
-        contextVideoRow.appendChild(rmVideo);
-      } else {
-        contextVideoRow.appendChild(mk("span", "h3s-hint", "未上传"));
-      }
-      const upVideo = mk("button", "h3s-btn", "+上传视频");
-      upVideo.title = "只接受 mp4/webm/mov/mkv/avi；最大 200 MB，时长必须小于 15 秒，且必须带音轨";
-      upVideo.addEventListener("click", () => {
+      const uploadContextVideo = async (file) => {
+        if (file.size > 200 * 1024 * 1024) throw new Error("视频不能大于 200 MB");
+        status.textContent = "正在上传上下文视频并校验时长…";
+        const fd = new FormData(); fd.append("video", file, file.name);
+        const resp = await api.fetchApi("/h3director/upload_context_video", { method: "POST", body: fd });
+        const data = await resp.json();
+        if (!(data.ok && data.name)) throw new Error(data.error || ("HTTP " + resp.status));
+        s.motion_context_video = data.name;
+        s.motion_context_video_label = data.label || file.name;
+        s.motion_context_video_duration = data.duration || null;
+        save(); renderEditor();
+        status.textContent = "上下文视频已上传：将用末尾画面帧和音频续接，不读取 latent";
+      };
+      const pickContextVideo = () => {
         const inp = document.createElement("input");
         inp.type = "file";
         inp.accept = "video/mp4,video/webm,video/quicktime,video/x-matroska,video/x-msvideo";
@@ -4751,25 +4744,72 @@ function buildStudio(node) {
           try {
             const file = inp.files && inp.files[0];
             if (!file) return;
-            if (file.size > 200 * 1024 * 1024) throw new Error("视频不能大于 200 MB");
-            status.textContent = "正在上传上下文视频并校验时长…";
-            const fd = new FormData(); fd.append("video", file, file.name);
-            const resp = await api.fetchApi("/h3director/upload_context_video", { method: "POST", body: fd });
-            const data = await resp.json();
-            if (!(data.ok && data.name)) throw new Error(data.error || ("HTTP " + resp.status));
-            s.motion_context_video = data.name;
-            s.motion_context_video_label = data.label || file.name;
-            s.motion_context_video_duration = data.duration || null;
-            save(); renderEditor();
-            status.textContent = "上下文视频已上传：将用末尾画面帧和音频续接，不读取 latent";
+            await uploadContextVideo(file);
           } catch (e) { status.textContent = "上下文视频上传失败: " + e.message; }
           finally { inp.remove(); }
         });
         inp.click();
-      });
-      contextVideoRow.appendChild(upVideo);
-      contextVideoRow.appendChild(mk("span", "h3s-hint", "最大 200 MB｜时长 < 15 秒｜需含音轨"));
-      editor.appendChild(contextVideoRow);
+      };
+      const curContextVideo = s.motion_context_video;
+      if (!curContextVideo) {
+        const empty = mk("div", "h3s-vdz");
+        empty.style.minHeight = "88px";
+        empty.style.flex = "none";
+        const upVideo = mk("button", "h3s-btn", "+ 上传上下文视频");
+        upVideo.addEventListener("click", (ev) => { ev.stopPropagation(); pickContextVideo(); });
+        empty.appendChild(upVideo);
+        empty.appendChild(mk("div", "h3s-hint", "上传上一段成片。最大 200 MB｜时长 < 15 秒｜需含音轨"));
+        editor.appendChild(empty);
+      } else {
+        const disp = s.motion_context_video_label || curContextVideo;
+        const head = mk("div", "h3s-row");
+        const badge = mk("span", "num", "V1");
+        badge.style.cssText = "background:rgba(24,95,165,0.92);color:#fff;font-size:11px;padding:1px 6px;border-radius:4px;";
+        head.appendChild(badge);
+        head.appendChild(mk("span", "h3s-hint", disp));
+        const btnRe = mk("button", "h3s-btn", "重新加载");
+        btnRe.title = "重新选择并替换上下文视频";
+        btnRe.addEventListener("click", pickContextVideo);
+        const btnRm = mk("button", "h3s-btn", "✕ 移除");
+        btnRm.title = "移除上下文视频";
+        btnRm.addEventListener("click", () => {
+          s.motion_context_video = null;
+          s.motion_context_video_label = null;
+          s.motion_context_video_duration = null;
+          save(); renderEditor();
+        });
+        head.append(btnRe, btnRm);
+        if (s.motion_context_video_duration) head.appendChild(mk("span", "h3s-hint",
+          Number(s.motion_context_video_duration).toFixed(2) + "s"));
+        editor.appendChild(head);
+
+        const videoBox = mk("div", null);
+        videoBox.style.cssText = "position:relative;width:360px;height:203px;flex:none;border-radius:8px;"
+          + "overflow:hidden;background:#000;border:1px solid #3a5a7a;";
+        const player = document.createElement("video");
+        player.src = api.apiURL("/view?filename=" + encodeURIComponent(curContextVideo) + "&type=input");
+        player.preload = "metadata";
+        player.style.cssText = "width:100%;height:100%;object-fit:contain;display:block;cursor:pointer;";
+        player.title = "点击画面播放/暂停";
+        player.addEventListener("click", () => { if (player.paused) player.play(); else player.pause(); });
+        const nameOverlay = mk("span", null, disp);
+        nameOverlay.style.cssText = "position:absolute;left:5px;top:4px;max-width:345px;overflow:hidden;text-overflow:ellipsis;"
+          + "white-space:nowrap;color:#fff;font-size:10px;text-shadow:0 1px 2px #000;pointer-events:none;";
+        videoBox.append(player, nameOverlay);
+        editor.appendChild(videoBox);
+
+        const controls = mk("div", "h3s-row");
+        controls.style.cssText = "justify-content:center;gap:10px;";
+        const play = mk("button", "h3s-btn primary", "▶ 播放");
+        const pause = mk("button", "h3s-btn", "⏸ 暂停");
+        const reset = mk("button", "h3s-btn", "⏹ 回开头");
+        [play, pause, reset].forEach((b) => { b.style.minWidth = "86px"; });
+        play.addEventListener("click", () => player.play());
+        pause.addEventListener("click", () => player.pause());
+        reset.addEventListener("click", () => { player.pause(); player.currentTime = 0; });
+        controls.append(play, pause, reset);
+        editor.appendChild(controls);
+      }
     }
 
     /* ---- 音频可视化裁剪：波形 + 左右拖柄选区间 + 保留/删除模式 + 起始偏移 ---- */
