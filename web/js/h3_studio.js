@@ -4936,7 +4936,8 @@ function buildStudio(node) {
       });
       if (s.video_refs.length < 3) {
         const add = mk("button", "h3s-btn", "+ 上传参考视频");
-        add.style.cssText = "height:84px;min-width:126px;";
+        // 与左侧参考视频卡片等宽、同一高度，避免小按钮显得突兀。
+        add.style.cssText = "height:calc(100% - 8px);width:220px;min-width:220px;flex:none;";
         add.title = "最多 3 个；这些视频会参与 H3 参考生成";
         add.addEventListener("click", () => chooseRefVideo());
         refVideoGrid.appendChild(add);
