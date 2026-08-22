@@ -4765,7 +4765,7 @@ function buildStudio(node) {
       } else {
         const disp = s.motion_context_video_label || curContextVideo;
         const head = mk("div", "h3s-row");
-        const badge = mk("span", "num", "V1");
+        const badge = mk("span", "num", "<前段视频>");
         badge.style.cssText = "background:rgba(24,95,165,0.92);color:#fff;font-size:11px;padding:1px 6px;border-radius:4px;";
         head.appendChild(badge);
         head.appendChild(mk("span", "h3s-hint", disp));
@@ -4783,6 +4783,7 @@ function buildStudio(node) {
         head.append(btnRe, btnRm);
         if (s.motion_context_video_duration) head.appendChild(mk("span", "h3s-hint",
           Number(s.motion_context_video_duration).toFixed(2) + "s"));
+        head.appendChild(mk("span", "h3s-hint", "仅 Motion Context 使用，不计入参考视频，也不会生成 <Video N>"));
         editor.appendChild(head);
 
         const videoBox = mk("div", null);
@@ -4823,6 +4824,117 @@ function buildStudio(node) {
           save();
         }, controls);
       }
+    }
+
+    // 多参生视频的独立参考视频。前段视频（若有）始终在上方单列，只作为
+    // Motion Context 上下文；这里的 1~3 个才会送入 H3 ref_videos / <Video N>。
+    if (generationMode === "multi_ref") {
+      if (!Array.isArray(s.video_refs)) s.video_refs = [];
+      if (!s.video_labels || typeof s.video_labels !== "object") s.video_labels = {};
+      if (!s.video_audio_refs || typeof s.video_audio_refs !== "object") s.video_audio_refs = {};
+      const refVideoTitle = mk("div", "h3s-hint", "视频参考（最多 3 个；参与参考生成，可在提示词中用 <Video N>）：");
+      editor.appendChild(refVideoTitle);
+
+      const uploadRefVideo = async (file, replaceIndex = -1) => {
+        if (!/\.(mp4|webm|mov|mkv|avi)$/i.test(file.name)) throw new Error("仅支持 mp4/webm/mov/mkv/avi 视频");
+        if (replaceIndex < 0 && s.video_refs.length >= 3) throw new Error("最多只能上传 3 个参考视频");
+        status.textContent = "正在上传参考视频…";
+        const fd = new FormData(); fd.append("video", file, file.name);
+        const resp = await api.fetchApi("/h3director/upload_video", { method: "POST", body: fd });
+        const data = await resp.json();
+        if (!(data.ok && data.name)) throw new Error(data.error || ("HTTP " + resp.status));
+        if (replaceIndex >= 0) {
+          const old = s.video_refs[replaceIndex];
+          if (old) {
+            delete s.video_labels[old];
+            delete s.video_audio_refs[old];
+          }
+          s.video_refs[replaceIndex] = data.name;
+        } else {
+          s.video_refs.push(data.name);
+        }
+        s.video_labels[data.name] = data.label || file.name;
+        save(); renderEditor();
+        status.textContent = "参考视频已上传";
+      };
+      const chooseRefVideo = (replaceIndex = -1) => {
+        const inp = document.createElement("input");
+        inp.type = "file";
+        inp.accept = "video/mp4,video/webm,video/quicktime,video/x-matroska,video/x-msvideo";
+        inp.style.display = "none";
+        document.body.appendChild(inp);
+        inp.addEventListener("change", async () => {
+          try {
+            const file = inp.files && inp.files[0];
+            if (!file) return;
+            await uploadRefVideo(file, replaceIndex);
+          } catch (e) { status.textContent = "参考视频上传失败: " + e.message; }
+          finally { inp.remove(); }
+        });
+        inp.click();
+      };
+
+      const refVideoGrid = mk("div", "h3s-refs");
+      refVideoGrid.style.cssText = "min-height:96px;align-items:flex-start;";
+      s.video_refs.forEach((name, index) => {
+        const card = mk("div", null);
+        card.style.cssText = "width:220px;flex:none;border:1px solid #3a5a7a;border-radius:7px;overflow:hidden;background:#101318;";
+        const head = mk("div", "h3s-row");
+        head.style.cssText = "padding:4px 5px;gap:5px;";
+        const badge = mk("span", "num", "V" + (index + 1));
+        badge.style.cssText = "background:rgba(24,95,165,0.92);color:#fff;font-size:10px;padding:1px 5px;border-radius:4px;";
+        head.appendChild(badge);
+        const label = s.video_labels[name] || name;
+        const nameEl = mk("span", "h3s-hint", label);
+        nameEl.style.cssText += "max-width:116px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+        head.appendChild(nameEl);
+        const reload = mk("button", "h3s-btn", "重载");
+        reload.title = "重新选择该参考视频";
+        reload.style.cssText = "padding:2px 5px;font-size:10px;";
+        reload.addEventListener("click", () => chooseRefVideo(index));
+        const remove = mk("button", "h3s-btn", "×");
+        remove.title = "移除该参考视频";
+        remove.style.cssText = "padding:2px 5px;font-size:10px;";
+        remove.addEventListener("click", () => {
+          const removed = s.video_refs.splice(index, 1)[0];
+          delete s.video_labels[removed];
+          delete s.video_audio_refs[removed];
+          save(); renderEditor();
+        });
+        head.append(reload, remove);
+        const preview = document.createElement("video");
+        preview.src = api.apiURL("/view?filename=" + encodeURIComponent(name) + "&type=input");
+        preview.controls = true;
+        preview.preload = "metadata";
+        preview.style.cssText = "display:block;width:220px;height:124px;object-fit:contain;background:#000;";
+        const soundRow = mk("label", "h3s-row");
+        soundRow.style.cssText = "padding:5px 7px;gap:5px;font-size:10px;cursor:pointer;";
+        const soundCheck = document.createElement("input");
+        soundCheck.type = "checkbox";
+        soundCheck.checked = !!s.video_audio_refs[name];
+        soundCheck.style.cssText = "width:15px;height:15px;accent-color:#378ADD;";
+        soundCheck.title = "勾选后，把此视频的音轨接入对应的 ref_video_audio";
+        soundCheck.addEventListener("change", () => {
+          s.video_audio_refs[name] = soundCheck.checked;
+          save();
+          status.textContent = soundCheck.checked
+            ? "<Video " + (index + 1) + "> 已启用视频声音参考"
+            : "<Video " + (index + 1) + "> 已关闭视频声音参考";
+        });
+        soundRow.append(soundCheck, mk("span", "h3s-hint", "视频声音参考"));
+        card.append(head, preview, soundRow);
+        refVideoGrid.appendChild(card);
+      });
+      if (s.video_refs.length < 3) {
+        const add = mk("button", "h3s-btn", "+ 上传参考视频");
+        add.style.cssText = "height:84px;min-width:126px;";
+        add.title = "最多 3 个；这些视频会参与 H3 参考生成";
+        add.addEventListener("click", () => chooseRefVideo());
+        refVideoGrid.appendChild(add);
+      } else {
+        refVideoGrid.appendChild(mk("span", "h3s-hint", "已达 3 个参考视频上限"));
+      }
+      editor.appendChild(refVideoGrid);
     }
 
     /* ---- 音频可视化裁剪：波形 + 左右拖柄选区间 + 保留/删除模式 + 起始偏移 ---- */

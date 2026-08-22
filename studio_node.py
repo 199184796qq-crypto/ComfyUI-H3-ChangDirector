@@ -1034,10 +1034,13 @@ class H3DirectorStudio:
         # 提示词里用 <Video N> 引用；ref_video_audio_N 按索引与 ref_video_N 配对。
         ref_videos = {}
         ref_video_audios = {}
-        for vn in ([] if endpoint_mode else [n for n in (seg_cfg.get("video_refs") or []) if n]):
-            if len(ref_videos) >= 3:
-                _log("[H3导演台] 参考视频已达 3 路上限，%s 被忽略" % vn)
-                break
+        video_names = [] if endpoint_mode else [n for n in (seg_cfg.get("video_refs") or []) if n]
+        if len(video_names) > 3:
+            raise ValueError("[H3导演台] 段%d最多只能上传 3 个参考视频。" % seg_idx)
+        video_audio_refs = seg_cfg.get("video_audio_refs") or {}
+        if not isinstance(video_audio_refs, dict):
+            video_audio_refs = {}
+        for vn in video_names:
             vp = _resolve_input(vn)
             if not os.path.exists(vp):
                 _log("[H3导演台] 警告：参考视频不存在 %s" % vn)
@@ -1046,10 +1049,11 @@ class H3DirectorStudio:
                 vframes, vaudio = _load_video_for_ref(vp, ffmpeg, seg_cfg)
                 idx = len(ref_videos)
                 ref_videos["ref_video_%d" % idx] = vframes
-                if vaudio is not None:
+                if vaudio is not None and bool(video_audio_refs.get(vn)):
                     ref_video_audios["ref_video_audio_%d" % idx] = vaudio
                 _log("[H3导演台] 段%d 参考视频 <Video %d>: %s（%d 帧%s）" % (
-                    seg_idx, idx + 1, vn, vframes.shape[0], "，含音轨" if vaudio else ""))
+                    seg_idx, idx + 1, vn, vframes.shape[0],
+                    "，已接视频声音参考" if vaudio is not None and bool(video_audio_refs.get(vn)) else ""))
             except Exception as e:
                 _log("[H3导演台] 参考视频加载失败 %s: %s" % (vn, e))
         if not ref_videos:
@@ -1532,6 +1536,10 @@ class H3DirectorStudio:
                 "audio_ref_ambient": bool(seg_cfg.get("audio_ref_ambient")),
                 "voice_refs": [_input_signature(n) for n in (seg_cfg.get("voice_refs") or [])],
                 "video_refs": [_input_signature(n) for n in (seg_cfg.get("video_refs") or [])],
+                "video_audio_refs": {
+                    str(n): bool((seg_cfg.get("video_audio_refs") or {}).get(n))
+                    for n in (seg_cfg.get("video_refs") or []) if n
+                },
                 "video_fps": seg_cfg.get("video_fps") or 24,
                 "video_skip": seg_cfg.get("video_skip") or 0,
                 "width": seg_cfg.get("width") or 0,
