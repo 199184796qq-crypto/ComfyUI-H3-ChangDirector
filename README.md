@@ -7,6 +7,8 @@
 
 **云平台 Motion Context 续接：** 默认“latent 延续：本地自动续接”完全保持原有逻辑。若平台不能保存 H3 latent，可在创作界面为第 2 段及以后勾选 `MotionContext`，将来源改为“视频延续”，并在本段音频下方上传上一段成片；文件最大 **200 MB**、时长必须**小于 15 秒**、且需要包含音轨。运行时会从该视频末尾读取画面帧和音频，分别作为 Motion Context 的 `context_frames` 与 `context_audio`，不读取也不保存 latent。也可选择“上传 latent”，导入由 H3 Motion Context Save Latent 创建的 `.safetensors` 文件。
 
+**阿里云 OSS latent 续接：** 连接“阿里云 OSS 配置（REST）”到导演台左侧的 `阿里云OSS配置` 插口后，可将来源选为“Latent延续：阿里云”。配置节点的 `object_key` 是可编辑的保存目录，默认填 `H3`；程序自动补 `/`，因此填 `H3` 与 `H3/` 都会得到 `H3/clip_00001.safetensors`。`Clip_index=1` 读取上一段对象，本段生成后保存为下一编号对象。节点在内存中序列化/反序列化 safetensors，不产生本地 latent 文件。
+
 2.18.0 新增内嵌 `ComfyUI-H3-Motion-Context` 接力：节点级全局设置区提供上下文保存目录、加载目录、画面/音频上下文长度和音频尾部匹配参数；每个视频段提供 `MotionContext` 开关。第1段始终绕过加载，后续启用段加载上一段固定 clip 槽位。无论段级开关是否启用，每个实际生成段都会保存自己的 H3 AV latent，文件名沿用 Motion Context 的 `clip_00001.safetensors` 固定编号规则。
 
 2.26.0 新增每段的 `帧锚点 Add Guide` 轨道：可为同一段添加多个图片、音频或音画锚点，按填写秒数自动排序并连续串联到 H3 的正向条件。启用 Motion Context 时，锚点秒数仍按最终导出片段计算，系统会自动避开被裁掉的接力前缀。

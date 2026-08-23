@@ -4340,13 +4340,14 @@ function buildStudio(node) {
       [
         ["local_latent", "latent 延续：本地自动续接"],
         ["upload_latent", "latent 延续：上传 latent"],
+        ["aliyun_oss", "Latent延续：阿里云"],
         ["video", "视频延续：上传上一段视频"],
       ].forEach(([value, label]) => {
         const opt = document.createElement("option");
         opt.value = value; opt.textContent = label; sourceSel.appendChild(opt);
       });
       sourceSel.value = motionContextSource;
-      sourceSel.title = "本地自动续接保持旧逻辑；上传 latent 使用 H3 Motion Context 保存的 .safetensors；视频延续不读取或保存 latent，而是把上传视频的末尾画面和音频作为上下文。";
+      sourceSel.title = "本地自动续接保持旧逻辑；上传 latent 使用 H3 Motion Context 保存的 .safetensors；阿里云按配置节点的 object_key/clip_00001.safetensors 固定槽位保存和读取；视频延续不读取或保存 latent。";
       sourceSel.addEventListener("change", () => {
         s.motion_context = true;
         s.use_tail = false;
@@ -4355,7 +4356,7 @@ function buildStudio(node) {
       });
       sourceRow.appendChild(sourceSel);
 
-      if (motionContextSource === "local_latent") {
+      if (motionContextSource === "local_latent" || motionContextSource === "aliyun_oss") {
         const indexLabel = mk("span", "h3s-hint", "Clip_index");
         const indexIn = mk("input", "h3s-durinput");
         indexIn.type = "number";
@@ -4365,7 +4366,9 @@ function buildStudio(node) {
         const currentIndex = Number(s.motion_context_index);
         indexIn.value = String(Number.isFinite(currentIndex) && currentIndex >= 0
           ? Math.floor(currentIndex) : sel);
-        indexIn.title = "读取的本地 clip 编号。0=不加载旧 latent；本段会保存为 clip_(Index+1)。";
+        indexIn.title = motionContextSource === "aliyun_oss"
+          ? "读取的阿里云 clip 编号。0=不加载旧 latent；本段会保存为配置的 object_key/clip_(Index+1).safetensors。"
+          : "读取的本地 clip 编号。0=不加载旧 latent；本段会保存为 clip_(Index+1)。";
         indexIn.addEventListener("change", () => {
           const parsed = Math.floor(Number(indexIn.value));
           s.motion_context_index = Number.isFinite(parsed)
@@ -4374,7 +4377,9 @@ function buildStudio(node) {
           save(); renderEditor();
         });
         sourceRow.append(indexLabel, indexIn, mk("span", "h3s-hint",
-          "0=不加载；生成后保存 clip " + (Number(indexIn.value) + 1)));
+          motionContextSource === "aliyun_oss"
+            ? "0=不加载；生成后保存 object_key/clip_" + String(Number(indexIn.value) + 1).padStart(5, "0") + ".safetensors"
+            : "0=不加载；生成后保存 clip " + (Number(indexIn.value) + 1)));
       }
 
       if (motionContextSource === "upload_latent") {
@@ -4418,7 +4423,9 @@ function buildStudio(node) {
       }
       sourceRow.appendChild(mk("span", "h3s-hint", motionContextSource === "video"
         ? "视频上传区在本段音频下方"
-        : motionContextSource === "local_latent" ? "沿用原有本地 clip 自动续接" : "运行时校验 AV latent 格式"));
+        : motionContextSource === "local_latent" ? "沿用原有本地 clip 自动续接"
+        : motionContextSource === "aliyun_oss" ? "需连接左侧的阿里云 OSS 配置接口"
+        : "运行时校验 AV latent 格式"));
       editor.appendChild(sourceRow);
     }
 

@@ -10,14 +10,18 @@ import math
 import json
 import glob
 import hashlib
+import hmac
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import numpy as np
+import requests
 import torch
 from PIL import Image
+from safetensors.torch import load as safetensors_load, save as safetensors_save
 
 import folder_paths
 import comfy.samplers
@@ -43,7 +47,7 @@ CACHE_SCHEMA = 12  # v2.26.0：段级 Add Guide 时间锚点
 # 段级生成模式。multi_ref 保持旧版 Ref2VA 多参考图行为；其余模式走
 # MiniMaxH3ImageToVideo，并由本段 refs 的顺序提供首帧/尾帧。
 GENERATION_MODES = {"multi_ref", "text_to_video", "first_frame", "first_last_frame", "last_frame"}
-MOTION_CONTEXT_SOURCES = {"local_latent", "upload_latent", "video"}
+MOTION_CONTEXT_SOURCES = {"local_latent", "upload_latent", "aliyun_oss", "video"}
 
 SEGMENT_ASPECT_RATIOS = {
     "1:1 (Square)": (1, 1),
@@ -110,6 +114,119 @@ def _motion_context_local_index(seg_cfg, default_index=0):
     except (TypeError, ValueError):
         value = int(default_index)
     return max(0, min(9998, value))
+
+
+def _oss_config(value):
+    if not isinstance(value, dict):
+        raise ValueError("[H3导演台] 选择‘latent 延续：阿里云’时，必须连接‘阿里云 OSS 配置（REST）’节点。")
+    config = dict(value)
+    required = ("endpoint", "region", "bucket", "access_key_id", "access_key_secret")
+    missing = [name for name in required if not str(config.get(name) or "").strip()]
+    if missing:
+        raise ValueError("[H3导演台] 阿里云 OSS 配置缺少：%s" % ", ".join(missing))
+    config["use_system_proxy"] = bool(config.get("use_system_proxy", False))
+    prefix = str(config.get("object_key") or "H3").replace("\\", "/").strip().strip("/")
+    if not prefix or any(part in ("", ".", "..") for part in prefix.split("/")):
+        raise ValueError("[H3导演台] object_key 必须是有效的 OSS 目录，例如 H3 或 project_a/H3。")
+    config["object_key"] = prefix + "/"
+    return config
+
+
+def _oss_object_key(config, clip_index):
+    return "%sclip_%05d.safetensors" % (config["object_key"], int(clip_index))
+
+
+def _oss_endpoint_url(config, key):
+    endpoint = str(config["endpoint"]).strip()
+    endpoint = endpoint if "://" in endpoint else "https://" + endpoint
+    parts = urlsplit(endpoint)
+    if not parts.scheme or not parts.netloc or parts.path not in ("", "/"):
+        raise ValueError("[H3导演台] OSS endpoint 应为区域端点，例如 https://oss-cn-beijing.aliyuncs.com。")
+    bucket = str(config["bucket"]).strip()
+    host = parts.netloc if parts.netloc.startswith(bucket + ".") else bucket + "." + parts.netloc
+    return urlunsplit((parts.scheme, host, "/" + quote(key, safe="/-_.~"), "", ""))
+
+
+def _oss_signing_key(secret, date, region):
+    key = hmac.new(("aliyun_v4" + secret).encode("utf-8"), date.encode("utf-8"), hashlib.sha256).digest()
+    key = hmac.new(key, region.encode("utf-8"), hashlib.sha256).digest()
+    key = hmac.new(key, b"oss", hashlib.sha256).digest()
+    return hmac.new(key, b"aliyun_v4_request", hashlib.sha256).digest()
+
+
+def _oss_headers(method, key, config, content_type=""):
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date = timestamp[:8]
+    headers = {"x-oss-content-sha256": "UNSIGNED-PAYLOAD", "x-oss-date": timestamp}
+    if content_type:
+        headers["Content-Type"] = content_type
+    if str(config.get("security_token") or "").strip():
+        headers["x-oss-security-token"] = str(config["security_token"]).strip()
+    signed = sorted((name.lower(), " ".join(value.strip().split())) for name, value in headers.items()
+                    if name.lower().startswith("x-oss-") or name.lower() in ("content-type", "content-md5"))
+    canonical_headers = "".join("%s:%s\n" % item for item in signed)
+    canonical_uri = quote("/%s/%s" % (config["bucket"], key), safe="/-_.~")
+    canonical_request = "%s\n%s\n\n%s\n\nUNSIGNED-PAYLOAD" % (method, canonical_uri, canonical_headers)
+    scope = "%s/%s/oss/aliyun_v4_request" % (date, config["region"])
+    string_to_sign = "OSS4-HMAC-SHA256\n%s\n%s\n%s" % (
+        timestamp, scope, hashlib.sha256(canonical_request.encode("utf-8")).hexdigest())
+    signature = hmac.new(
+        _oss_signing_key(str(config["access_key_secret"]), date, str(config["region"])),
+        string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers["Authorization"] = "OSS4-HMAC-SHA256 Credential=%s/%s,Signature=%s" % (
+        config["access_key_id"], scope, signature)
+    return headers
+
+
+def _oss_request(method, key, config, content_type="", **kwargs):
+    session = requests.Session()
+    session.trust_env = config["use_system_proxy"]
+    response = session.request(
+        method, _oss_endpoint_url(config, key), headers=_oss_headers(method, key, config, content_type),
+        timeout=(10, 600), **kwargs)
+    if not response.ok:
+        detail = response.text[:1000].strip()
+        response.close()
+        raise RuntimeError("[H3导演台] OSS %s %s 失败（HTTP %d）：%s" % (
+            method, key, response.status_code, detail))
+    return response
+
+
+def _h3_av_streams(samples):
+    parts = list(samples.unbind()) if hasattr(samples, "unbind") else list(samples) if isinstance(samples, (tuple, list)) else []
+    if len(parts) < 2:
+        raise ValueError("[H3导演台] 无法保存阿里云 latent：当前输出不是 H3 AV latent。")
+    return parts[0].cpu().contiguous(), parts[1].cpu().contiguous()
+
+
+def _oss_save_h3_latent(samples, config, clip_index):
+    video, audio = _h3_av_streams(samples)
+    key = _oss_object_key(config, clip_index)
+    payload = safetensors_save({"video": video, "audio": audio},
+                               metadata={"format": "h3_motion_context_av_v1"})
+    response = _oss_request("PUT", key, config, content_type="application/octet-stream", data=payload)
+    etag = response.headers.get("ETag", "").strip('"')
+    response.close()
+    return key, etag
+
+
+def _oss_load_h3_latent(config, clip_index):
+    key = _oss_object_key(config, clip_index)
+    response = _oss_request("GET", key, config)
+    payload = response.content
+    response.close()
+    data = safetensors_load(payload)
+    if "video" not in data or "audio" not in data:
+        raise ValueError("[H3导演台] OSS 对象 %s 不是有效的 H3 Motion Context latent。" % key)
+    return {"samples": [data["video"], data["audio"]]}, key
+
+
+def _oss_object_etag(config, clip_index):
+    key = _oss_object_key(config, clip_index)
+    response = _oss_request("HEAD", key, config)
+    etag = response.headers.get("ETag", "").strip('"')
+    response.close()
+    return etag
 
 
 def _log(msg):
@@ -1032,6 +1149,8 @@ class H3DirectorStudio:
                     "forceInput": True,
                     "tooltip": "连接任意 STRING 文本节点。运行时覆盖当前选中段右侧文本框的提示词；"
                                "断开后恢复使用文本框原内容。"}),
+                "阿里云OSS配置": ("ALIYUN_OSS_CONFIG", {
+                    "tooltip": "选择‘latent 延续：阿里云’时，连接‘阿里云 OSS 配置（REST）’节点。"}),
             },
             "hidden": {
                 "h3_prompt_graph": "PROMPT",
@@ -1055,7 +1174,7 @@ class H3DirectorStudio:
                       context_load_dir="h3_context", context_length="22",
                       audio_context_length=24, context_match_tail=True,
                       external_sigmas=None, save_context_latent=True,
-                      return_internal_outputs=False):
+                      return_internal_outputs=False, oss_config=None):
         # 0) 计算本段时长与帧数（缺失时用节点默认时长），帧数对齐 ≡5 (mod 17)
         # 段级分辨率覆盖（v2.8）：每段视频尺寸可不同；留空=跟随节点宽高
         _wo = int(seg_cfg.get("width") or 0)
@@ -1396,12 +1515,15 @@ class H3DirectorStudio:
                         raise ValueError("[H3导演台] 段%d的上传 latent 不存在: %s" % (seg_idx, latent_name))
                     previous_latent = LoadClass().load(latent_path, clip_index=0)[0]
                     source_note = "上传 latent " + os.path.basename(latent_path)
+                elif motion_source == "aliyun_oss" and motion_local_index > 0:
+                    previous_latent, object_key = _oss_load_h3_latent(oss_config, motion_local_index)
+                    source_note = "阿里云 " + object_key
                 elif motion_local_index > 0:
                     previous_latent = LoadClass().load(context_load_dir, clip_index=motion_local_index)[0]
                     source_note = "本地 clip %d" % motion_local_index
                 else:
                     previous_latent = None
-                    source_note = "本地 index 0（不加载 latent）"
+                    source_note = "阿里云 index 0（不加载 latent）" if motion_source == "aliyun_oss" else "本地 index 0（不加载 latent）"
                 if previous_latent is None:
                     _log("[H3导演台] 段%d MotionContext 已选择：%s" % (
                         seg_idx, source_note))
@@ -1462,12 +1584,15 @@ class H3DirectorStudio:
         # 是否保存由“下一段”是否选择本地 latent 自动续接决定。这样云平台在
         # 视频延续链路中连首段也不会尝试写 nested latent。
         if save_context_latent:
-            if SaveClass is None:
-                MotionClass, TrimClass, SaveClass, LoadClass = _motion_context_classes()
             save_index = _motion_context_local_index(seg_cfg, seg_idx - 1) + 1
-            saved_context_path = SaveClass().save(
-                {"samples": samples}, _context_save_prefix(context_save_dir),
-                clip_index=save_index)[0]
+            if motion_source == "aliyun_oss":
+                saved_context_path, _ = _oss_save_h3_latent(samples, oss_config, save_index)
+            else:
+                if SaveClass is None:
+                    MotionClass, TrimClass, SaveClass, LoadClass = _motion_context_classes()
+                saved_context_path = SaveClass().save(
+                    {"samples": samples}, _context_save_prefix(context_save_dir),
+                    clip_index=save_index)[0]
             _log("[H3导演台] 段%d 上下文 clip %d 已保存：%s" % (
                 seg_idx, save_index, saved_context_path))
         else:
@@ -1549,7 +1674,7 @@ class H3DirectorStudio:
                汇总输出="仅预览帧(推荐)", project_id="", text_shared_refs_json="[]",
                output_dir="output", filename_prefix="ComfyUI",
                外部文本目标段=1,
-               fl2va_model=None, 外部SIGMAS=None, 外部文本=None,
+               fl2va_model=None, 外部SIGMAS=None, 外部文本=None, 阿里云OSS配置=None,
                h3_prompt_graph=None, h3_unique_id=None):
         # v2.3: two independent workspaces; ui_mode selects the dataset,
         # outputs use per-mode file names so the two never overwrite each other.
@@ -1563,6 +1688,10 @@ class H3DirectorStudio:
         if not segments:
             raise ValueError("[H3导演台] 没有任何分段，请在节点时间轴界面里添加分段")
 
+        oss_config = None
+        if any(_motion_context_source(segment) == "aliyun_oss" for segment in segments):
+            oss_config = _oss_config(阿里云OSS配置)
+
         # 标准 STRING 扩展口：只覆盖界面当前选中的一段，其他段仍使用各自文本框。
         # 只修改本次解析出的配置副本，不回写/破坏右侧文本框的备用内容。
         external_text_target = max(1, min(len(segments), int(外部文本目标段 or 1)))
@@ -1575,7 +1704,7 @@ class H3DirectorStudio:
             if _sc.get("motion_context") is True:
                 _sc["motion_context"] = True
                 _sc["use_tail"] = False
-                if _motion_context_source(_sc) == "local_latent":
+                if _motion_context_source(_sc) in ("local_latent", "aliyun_oss"):
                     _sc["motion_context_index"] = _motion_context_local_index(_sc, _idx)
             else:
                 _sc["motion_context"] = False
@@ -1742,11 +1871,11 @@ class H3DirectorStudio:
 
             motion_source = _motion_context_source(seg_cfg)
             motion_local_index = _motion_context_local_index(seg_cfg, k)
-            # 选择“本地 latent 延续”的当前段负责保存 index+1。这样 index=0
+            # 选择本地或阿里云 latent 延续的当前段负责保存 index+1。这样 index=0
             # 可作为新链起点：不加载旧文件，生成后写出 clip_00001。
             save_context_latent = bool(
                 seg_cfg.get("motion_context", False) is True
-                and motion_source == "local_latent"
+                and motion_source in ("local_latent", "aliyun_oss")
             )
             save_context_index = motion_local_index + 1
 
@@ -1765,6 +1894,7 @@ class H3DirectorStudio:
                 "motion_context_index": motion_local_index,
                 "motion_context_latent": _input_signature(seg_cfg.get("motion_context_latent")),
                 "motion_context_video": _input_signature(seg_cfg.get("motion_context_video")),
+                "oss_target": (_oss_object_key(oss_config, save_context_index) if motion_source == "aliyun_oss" else None),
                 "save_context_latent": save_context_latent,
                 "save_context_index": save_context_index if save_context_latent else None,
                 "tail_mode": tail_mode,
@@ -1811,6 +1941,8 @@ class H3DirectorStudio:
                 "context_source": (
                     _input_signature(seg_cfg.get("motion_context_video")) if motion_source == "video"
                     else _input_signature(seg_cfg.get("motion_context_latent")) if motion_source == "upload_latent"
+                    else {"key": _oss_object_key(oss_config, motion_local_index), "etag": _oss_object_etag(oss_config, motion_local_index)}
+                    if motion_source == "aliyun_oss" and motion_local_index > 0
                     else (_path_signature(_context_slot_path(上下文加载目录, motion_local_index))
                           if motion_local_index > 0 and seg_cfg.get("motion_context", False) is True
                           and _context_slot_path(上下文加载目录, motion_local_index) else None)
@@ -1832,6 +1964,11 @@ class H3DirectorStudio:
 
             # 本地 latent 模式要保证当前指定的 index+1 主槽位已经写出。
             context_slot = _context_slot_path(上下文保存目录, save_context_index)
+            if motion_source == "aliyun_oss" and save_context_latent:
+                try:
+                    context_slot = _oss_object_etag(oss_config, save_context_index)
+                except RuntimeError:
+                    context_slot = None
             if save_context_latent and context_slot is None:
                 meta_ok = False
 
@@ -1854,7 +1991,8 @@ class H3DirectorStudio:
                     context_match_tail=MotionContext匹配尾部,
                     external_sigmas=外部SIGMAS,
                     save_context_latent=save_context_latent,
-                    return_internal_outputs=return_internal_outputs)
+                    return_internal_outputs=return_internal_outputs,
+                    oss_config=oss_config)
                 if return_internal_outputs:
                     output_latent = segment_latent
                     output_positive = segment_positive
@@ -1867,6 +2005,7 @@ class H3DirectorStudio:
                 }
                 ran.append(seg_idx)
                 mc_note = ({"local_latent": "本地 latent（index %d）" % motion_local_index,
+                            "aliyun_oss": "阿里云 latent（index %d）" % motion_local_index,
                             "upload_latent": "上传 latent", "video": "视频延续"}.get(motion_source)
                     if seg_cfg.get("motion_context", False) is True else "关闭")
                 save_note = "已保存 clip %d" % save_context_index if save_context_latent else "不保存 latent"
