@@ -6,9 +6,12 @@
 import os
 import gc
 import re
+import sys
 import math
 import json
 import glob
+import inspect
+import importlib
 import hashlib
 import hmac
 import shutil
@@ -415,7 +418,10 @@ def _motion_context_classes():
 
     The dependency is looked up lazily from ComfyUI's registered node map so
     this plugin always executes the installed Motion Context implementation
-    instead of carrying a stale copy of its continuation algorithm.
+    instead of carrying a stale copy of its continuation algorithm.  Newer
+    MultiRef builds intentionally hide the four classic IDs when the base pack
+    is present; if the base IDs are absent, recover the matching classes from
+    one of MultiRef's registered extension nodes.
     """
     import nodes as comfy_nodes
 
@@ -425,14 +431,125 @@ def _motion_context_classes():
         "MiniMaxH3MotionContextSaveLatent",
         "MiniMaxH3MotionContextLoadLatent",
     )
-    missing = [name for name in names if name not in comfy_nodes.NODE_CLASS_MAPPINGS]
-    if missing:
-        raise RuntimeError(
-            "[H3导演台] Motion Context 依赖未加载：%s。请安装并启用 "
-            "ComfyUI-H3-Motion-Context，然后完全重启 ComfyUI。"
-            % ", ".join(missing)
+    registry = comfy_nodes.NODE_CLASS_MAPPINGS
+    if all(name in registry for name in names):
+        return tuple(registry[name] for name in names)
+
+    # ComfyUI-H3-Motion-Context-MultiRef registers these extension-only IDs.
+    # Their classes live in the same Python module as its compatible classic
+    # implementation, even when __init__.py suppresses the duplicate IDs.
+    multiref_probes = (
+        "MiniMaxH3OptionalReferenceImage",
+        "MiniMaxH3CustomKeyframes",
+        "MiniMaxH3ExistingVideoMaskedContext",
+    )
+    for probe in multiref_probes:
+        probe_class = registry.get(probe)
+        if probe_class is None:
+            continue
+        module_name = getattr(probe_class, "__module__", "")
+        module = sys.modules.get(module_name)
+        if module is None and module_name:
+            try:
+                module = importlib.import_module(module_name)
+            except Exception:
+                module = None
+        if module is not None and all(hasattr(module, name) for name in names):
+            return tuple(getattr(module, name) for name in names)
+
+    missing = [name for name in names if name not in registry]
+    raise RuntimeError(
+        "[H3导演台] Motion Context 依赖未加载：%s。请安装并启用 "
+        "ComfyUI-H3-Motion-Context 或 "
+        "ComfyUI-H3-Motion-Context-MultiRef，然后完全重启 ComfyUI。"
+        % ", ".join(missing)
+    )
+
+
+def _motion_context_frames_from_latent(context_latent, vae, context_length):
+    """Decode pixel frames required by native/MultiRef Motion Context.
+
+    The base implementation can use the previous AV latent directly for both
+    picture and sound.  MultiRef's native-guide implementation still requires
+    IMAGE frames for the visual guide, while accepting the latent for audio.
+    """
+    if not isinstance(context_latent, dict) or "samples" not in context_latent:
+        raise ValueError("[H3导演台] Motion Context latent 缺少 samples。")
+    video_latent = context_latent["samples"]
+    if getattr(video_latent, "is_nested", False):
+        video_latent = video_latent.unbind()[0]
+    elif isinstance(video_latent, (tuple, list)):
+        if not video_latent:
+            raise ValueError("[H3导演台] Motion Context latent 为空。")
+        video_latent = video_latent[0]
+    if getattr(video_latent, "ndim", 0) == 4:
+        video_latent = video_latent.unsqueeze(0)
+    frames = vae.decode(video_latent)
+    if getattr(frames, "ndim", 0) == 5:
+        frames = frames[0]
+    if getattr(frames, "ndim", 0) != 4:
+        raise ValueError(
+            "[H3导演台] Motion Context latent 解码后应为 [T,H,W,C]，实际为 %s。"
+            % (tuple(getattr(frames, "shape", ())),)
         )
-    return tuple(comfy_nodes.NODE_CLASS_MAPPINGS[name] for name in names)
+    return frames[-max(1, int(context_length)):]
+
+
+def _motion_context_apply(MotionClass, conditioning, vae, latent,
+                          context_length, audio_context_length,
+                          context_frames=None, context_latent=None,
+                          audio_vae=None, context_audio=None):
+    """Call either the base or MultiRef Motion Context signature safely."""
+    parameters = inspect.signature(MotionClass.apply).parameters
+    requires_frames = (
+        "context_frames" in parameters
+        and parameters["context_frames"].default is inspect.Parameter.empty
+    )
+    if context_frames is None and requires_frames:
+        if context_latent is None:
+            raise ValueError(
+                "[H3导演台] 当前 Motion Context 实现需要上下文画面帧。"
+            )
+        context_frames = _motion_context_frames_from_latent(
+            context_latent, vae, context_length)
+
+    # MultiRef's native timeline mode requires the audio window not to exceed
+    # the visual guide.  The base pack accepts its historic 22/24 default.
+    effective_audio_length = int(audio_context_length)
+    if "audio_mode" in parameters:
+        effective_audio_length = min(
+            effective_audio_length, max(1, int(context_length)))
+
+    values = {
+        "conditioning": conditioning,
+        "vae": vae,
+        "latent": latent,
+        "context_frames": context_frames,
+        "context_length": int(context_length),
+        "encode_mode": "video",
+        "anchor_mode": "head",
+        "crop": "disabled",
+        "audio_context_length": effective_audio_length,
+        "audio_mode": "timeline",
+        "context_latent": context_latent,
+        "audio_vae": audio_vae,
+        "context_audio": context_audio,
+    }
+    kwargs = {name: values[name] for name in parameters if name in values}
+    result = MotionClass().apply(**kwargs)
+    if not isinstance(result, (tuple, list)) or len(result) < 2:
+        raise RuntimeError("[H3导演台] Motion Context 返回值格式不兼容。")
+    return result[0], int(result[1])
+
+
+def _motion_context_trim(TrimClass, images, trim_frames, audio, fps,
+                         match_tail):
+    """Normalize the base two-output and MultiRef four-output trim nodes."""
+    result = TrimClass().trim(
+        images, trim_frames, audio=audio, fps=fps, match_tail=match_tail)
+    if not isinstance(result, (tuple, list)) or len(result) < 2:
+        raise RuntimeError("[H3导演台] Motion Context Trim 返回值格式不兼容。")
+    return result[0], result[1]
 
 
 def _context_directory(value):
@@ -1496,8 +1613,8 @@ class H3DirectorStudio:
                     raise ValueError("[H3导演台] 段%d的上下文视频不存在: %s" % (seg_idx, video_name))
                 context_frames, context_audio = _load_video_for_motion_context(
                     video_path, ffmpeg, max_frames=int(context_length))
-                cond, trim_frames = MotionClass().apply(
-                    cond, vae, latent, str(context_length),
+                cond, trim_frames = _motion_context_apply(
+                    MotionClass, cond, vae, latent, context_length,
                     audio_context_length=int(audio_context_length),
                     context_frames=context_frames, audio_vae=audio_vae,
                     context_audio=context_audio,
@@ -1528,8 +1645,8 @@ class H3DirectorStudio:
                     _log("[H3导演台] 段%d MotionContext 已选择：%s" % (
                         seg_idx, source_note))
                 else:
-                    cond, trim_frames = MotionClass().apply(
-                        cond, vae, latent, str(context_length),
+                    cond, trim_frames = _motion_context_apply(
+                        MotionClass, cond, vae, latent, context_length,
                         audio_context_length=int(audio_context_length),
                         context_latent=previous_latent,
                     )
@@ -1613,8 +1730,8 @@ class H3DirectorStudio:
             "sample_rate": int(audio["sample_rate"]),
         }
         if motion_enabled and trim_frames > 0:
-            frames, audio = TrimClass().trim(
-                frames, trim_frames, audio=audio, fps=float(FPS),
+            frames, audio = _motion_context_trim(
+                TrimClass, frames, trim_frames, audio=audio, fps=float(FPS),
                 match_tail=bool(context_match_tail))
             _log("[H3导演台] 段%d MotionContext 已裁掉开头 %d 帧，并同步处理音频" % (
                 seg_idx, trim_frames))
