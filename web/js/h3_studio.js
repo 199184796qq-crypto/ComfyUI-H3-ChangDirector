@@ -4,7 +4,7 @@ import { H3_TEXT_TEMPLATES } from "./h3_templates.js";
 
 /* 前端版本号：与 routes.py 的 BACKEND_VERSION 对应。
    status 接口返回的后端版本若与此不一致（用户改了代码但没重启/没强刷），状态栏红字提示。 */
-const H3S_VERSION = "2.25.2";
+const H3S_VERSION = "2.25.3";
 const activeProjectIds = new Map();
 
 function newProjectId() {
@@ -3867,7 +3867,8 @@ function buildStudio(node) {
     if (!s.generation_mode) s.generation_mode = generationMode;
     const motionContextSource = ["local_latent", "upload_latent", "aliyun_oss", "video"].includes(s.motion_context_source)
       ? s.motion_context_source : "local_latent";
-    if (!s.motion_context_source) s.motion_context_source = motionContextSource;
+    // 始终写回归一化后的值，避免旧工作流/前端重绘把新来源回退成“本地自动续接”。
+    s.motion_context_source = motionContextSource;
     const externalTextInput = (node.inputs || []).find((input) => input.name === "外部文本");
     const externalTextConnected = !!(externalTextInput && externalTextInput.link != null);
     if (externalTextConnected) {
@@ -4410,11 +4411,15 @@ function buildStudio(node) {
       });
       sourceSel.value = motionContextSource;
       sourceSel.title = "本地自动续接保持旧逻辑；上传 latent 使用 H3 Motion Context 保存的 .safetensors；阿里云按配置节点的 object_key/clip_00001.safetensors 固定槽位保存和读取；视频延续不读取或保存 latent。";
-      sourceSel.addEventListener("change", () => {
+      sourceSel.addEventListener("change", (event) => {
+        const selectedSource = String(event.currentTarget.value || "local_latent");
         s.motion_context = true;
         s.use_tail = false;
-        s.motion_context_source = sourceSel.value;
-        save(); renderEditor();
+        s.motion_context_source = ["local_latent", "upload_latent", "aliyun_oss", "video"].includes(selectedSource)
+          ? selectedSource : "local_latent";
+        save();
+        // select 的 change 冒泡完成后再重绘，防止浏览器将旧的 option 文本写回控件。
+        requestAnimationFrame(renderEditor);
       });
       sourceRow.appendChild(sourceSel);
 
