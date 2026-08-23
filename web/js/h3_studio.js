@@ -1689,6 +1689,8 @@ function buildStudio(node) {
   const btnTabC = mk("button", "h3s-btn", "创作界面");
   const btnTabV = mk("button", "h3s-btn", "视频界面");
   const btnTabT = mk("button", "h3s-btn", "文本界面");
+  const btnFullSegmentPrompt = mk("button", "h3s-btn", "全段提示词");
+  const btnAssignSegmentPrompt = mk("button", "h3s-btn", "分配提示词");
   btnTabC.title = "提示词 + 照片 + 配音/音色的创作模式";
   btnTabV.title = "参考视频驱动：上方视频（动作/运镜）+ 下方照片（外观），白模→成片、照片人物替换视频人物";
   btnTabT.title = "纯提示词生成：可上传共用参考图保持角色一致；粘贴带时间的分镜脚本一键解析成段";
@@ -1713,10 +1715,16 @@ function buildStudio(node) {
       return;
     }
     node.properties.h3_mode = m;
+    if (!node.properties.h3_prompt_tabs_visited || typeof node.properties.h3_prompt_tabs_visited !== "object") {
+      node.properties.h3_prompt_tabs_visited = {};
+    }
+    // 只有实际点过三个页签，才允许把全段文本批量覆盖到三套独立分段中。
+    node.properties.h3_prompt_tabs_visited[m] = true;
     segs = m === "video" ? videoSegs : m === "text" ? textSegs : createSegs;
     sel = 0;
     clearBoxSel();
     syncTabs();
+    syncPromptAssignmentControls();
     save();
     renderTimeline();
     renderEditor();
@@ -1738,6 +1746,55 @@ function buildStudio(node) {
   btnTailNone.title = "段2以后全部选择 MotionContext，并关闭尾帧续接";
   const totalLab = mk("span", "h3s-total", "");
   const status = mk("span", "h3s-status", "就绪");
+  const bulkPromptGroups = () => {
+    const source = String(node.properties.h3_full_segment_prompt || "").trim();
+    if (!source) return [];
+    const separator = String(node.properties.h3_full_segment_separator ?? "===").trim();
+    return (separator ? source.split(separator) : [source])
+      .map((part) => part.trim())
+      .filter(Boolean);
+  };
+  const allPromptTabsVisited = () => {
+    const visited = node.properties.h3_prompt_tabs_visited || {};
+    return ["create", "video", "text"].every((mode) => visited[mode] === true);
+  };
+  function syncPromptAssignmentControls() {
+    const groups = bulkPromptGroups();
+    const ready = allPromptTabsVisited() && groups.length > 0;
+    btnFullSegmentPrompt.classList.toggle("primary", node.properties.h3_full_segment_prompt_open === true);
+    btnAssignSegmentPrompt.disabled = !ready;
+    btnAssignSegmentPrompt.classList.toggle("primary", ready);
+    btnAssignSegmentPrompt.title = ready
+      ? `将 ${groups.length} 组提示词依次填入三个界面的现有片段`
+      : !groups.length
+        ? "先在“全段提示词”中填写至少一组内容"
+        : "请依次点击创作界面、视频界面、文本界面后再分配";
+  }
+  btnFullSegmentPrompt.title = "展开 / 收起全段提示词编辑框";
+  btnFullSegmentPrompt.addEventListener("click", () => {
+    node.properties.h3_full_segment_prompt_open = node.properties.h3_full_segment_prompt_open !== true;
+    save();
+    syncPromptAssignmentControls();
+    renderEditor();
+  });
+  btnAssignSegmentPrompt.addEventListener("click", () => {
+    const groups = bulkPromptGroups();
+    if (!allPromptTabsVisited() || !groups.length) {
+      syncPromptAssignmentControls();
+      status.textContent = !groups.length
+        ? "先填写“全段提示词”内容"
+        : "请依次点击创作界面、视频界面、文本界面后再分配";
+      return;
+    }
+    const mode = curMode();
+    const modeLabel = mode === "video" ? "视频界面" : mode === "text" ? "文本界面" : "创作界面";
+    const count = Math.min(groups.length, segs.length);
+    for (let i = 0; i < count; i++) segs[i].prompt = groups[i];
+    save();
+    renderTimeline();
+    renderEditor();
+    status.textContent = `已把 ${groups.length} 组提示词按顺序分配到当前${modeLabel}的 ${count}/${segs.length} 段（未对应片段保持原提示词）`;
+  });
   /* 前端版本号常显：用户截图可直接确认 JS 是否最新，终止"缓存旧版"猜谜 */
   const verLab = mk("span", "h3s-hint", "v" + H3S_VERSION);
   /* ▶ 运行（v2.9.3）：面板内直接触发生成，等价于点 ComfyUI 的队列按钮 */
@@ -1781,8 +1838,10 @@ function buildStudio(node) {
     save();
   });
   syncLowVramButton();
-  bar.append(btnTabC, btnTabV, btnTabT, btnRun, btnLowVram, btnAdd, btnDel, btnSelAll, btnSelNone, btnTailAll, btnTailNone, totalLab, verLab, status);
+  bar.append(btnTabC, btnTabV, btnTabT, btnFullSegmentPrompt, btnAssignSegmentPrompt,
+    btnRun, btnLowVram, btnAdd, btnDel, btnSelAll, btnSelNone, btnTailAll, btnTailNone, totalLab, verLab, status);
   syncTabs();
+  syncPromptAssignmentControls();
   box.appendChild(bar);
 
   /* 进度条 */
@@ -3066,7 +3125,57 @@ function buildStudio(node) {
      顶部脚本文本框：粘贴带时间标记的分镜文本 →「解析导入」自动拆段、
      按标记设每段时长、把对应正文写进每段提示词。数据独立（tsegments_json），
      产出文件名独立（漫剧t_/tailt_）。 */
+  function appendBulkPromptEditor() {
+    /* ======== 全段提示词：按分隔符批量分发到当前激活界面的已有片段 ======== */
+    if (node.properties.h3_full_segment_prompt_open === true) {
+      const bulkWrap = mk("div", "h3s-slrow");
+      bulkWrap.style.cssText = "display:block;margin:2px 0 6px;padding:7px;border:1px solid #315a7e;border-radius:7px;background:#151d26;";
+      bulkWrap.appendChild(mk("div", "h3s-hint",
+        "全段提示词：用下方分隔符划分每一段；“分配提示词”会从第 1 段开始，填入当前激活界面的现有片段。"));
+      const separatorRow = mk("div", "h3s-row");
+      separatorRow.style.marginTop = "5px";
+      separatorRow.appendChild(mk("span", "h3s-hint", "分段分隔符"));
+      const separatorInput = mk("input", "h3s-durinput");
+      separatorInput.type = "text";
+      separatorInput.style.width = "160px";
+      separatorInput.value = String(node.properties.h3_full_segment_separator ?? "===");
+      separatorInput.placeholder = "===";
+      separatorInput.title = "默认 ===；留空时整份文本视为一组";
+      separatorInput.addEventListener("input", () => {
+        node.properties.h3_full_segment_separator = separatorInput.value;
+        syncPromptAssignmentControls();
+        save();
+      });
+      separatorRow.appendChild(separatorInput);
+      separatorRow.appendChild(mk("span", "h3s-hint", "例如：第 1 段 === 第 2 段 === 第 3 段"));
+      bulkWrap.appendChild(separatorRow);
+
+      const bulkTa = mk("textarea", "h3s-ta");
+      bulkTa.placeholder = "在此粘贴全段提示词。每一组会按顺序填入当前激活界面的第 1、2、3… 段。";
+      bulkTa.value = String(node.properties.h3_full_segment_prompt || "");
+      bulkTa.style.cssText += "flex:none;height:180px;min-height:100px;margin-top:5px;";
+      const savedBulkSize = node.properties.h3_full_segment_prompt_size;
+      if (Array.isArray(savedBulkSize)) {
+        const [width, height] = savedBulkSize.map(Number);
+        if (Number.isFinite(width) && width >= 300) bulkTa.style.width = width + "px";
+        if (Number.isFinite(height) && height >= 100) bulkTa.style.height = height + "px";
+      }
+      bulkTa.addEventListener("input", () => {
+        node.properties.h3_full_segment_prompt = bulkTa.value;
+        syncPromptAssignmentControls();
+        save();
+      });
+      bulkWrap.appendChild(bulkTa);
+      attachBottomBar(bulkTa, 300, 100, (width, height, finished) => {
+        node.properties.h3_full_segment_prompt_size = [Math.round(width), Math.round(height)];
+        if (finished) save();
+      });
+      editor.appendChild(bulkWrap);
+    }
+  }
+
   function renderTextEditor(s) {
+
     /* ======== ⓪ 分镜脚本导入区（页面级：文本存 node.properties 随工作流保存）======== */
     editor.appendChild(mk("div", "h3s-hint",
       "分镜脚本（支持 MiniMax H3 官方 Base integrated_multimodal_description 与官方 Ref2VA 六字段模板；整篇无标记长文自动按 8~15 秒智能分段）："));
@@ -3704,6 +3813,7 @@ function buildStudio(node) {
         `已连接外部文本：运行时将覆盖段 ${sel + 1} 的提示词；断开连接后恢复右侧文本框内容。`));
     }
     /* 面板级界面切换（v2.1 视频 / v2.11 文本）：创作=完整编辑器；视频=参考视频整版；文本=纯提示词整版 */
+    appendBulkPromptEditor();
     const _m = node.properties.h3_mode || "create";
     if (_m === "video") { renderVideoEditor(s); return; }
     if (_m === "text") { renderTextEditor(s); return; }
@@ -3857,8 +3967,21 @@ function buildStudio(node) {
 
     /* 创作界面脚本导入：复用文本界面的 Base / Ref2VA / 普通文本解析器。
        参考图按角色名重新分配；同序配音和音色保留。 */
-    editor.appendChild(mk("div", "h3s-hint",
-      "剧本导入（MiniMax H3 Base / Ref2VA / 普通剧本；长时间线自动拆成不超过 15 秒的生成段）："));
+    // 创作界面的剧本导入区可独立折叠；默认展开，状态随工作流保存。
+    const createScriptWrap = document.createElement("details");
+    createScriptWrap.className = "h3s-slrow";
+    createScriptWrap.style.cssText = "display:block;margin-top:5px;min-width:260px;overflow:visible;";
+    createScriptWrap.open = node.properties.h3_create_script_open !== false;
+        createScriptWrap.addEventListener("toggle", () => {
+            node.properties.h3_create_script_open = createScriptWrap.open;
+            save();
+            autoFitCompactPanel();
+        });
+    const createScriptTitle = document.createElement("summary");
+    createScriptTitle.className = "h3s-hint";
+    createScriptTitle.style.cssText = "cursor:pointer;color:#9fd0ff;user-select:none;";
+    createScriptTitle.textContent = "剧本导入（MiniMax H3 Base / Ref2VA / 普通剧本；长时间线自动拆成不超过 15 秒的生成段）";
+    createScriptWrap.appendChild(createScriptTitle);
     const createScriptTa = mk("textarea", "h3s-ta");
     createScriptTa.style.cssText += "flex:none;height:110px;";
     createScriptTa.placeholder = "粘贴官方 Base / Ref2VA 模板或普通剧本。角色图先按文件名本地匹配，失败段才调用 API。";
@@ -3866,7 +3989,7 @@ function buildStudio(node) {
     createScriptTa.addEventListener("input", () => {
       node.properties.h3_create_script = createScriptTa.value;
     });
-    editor.appendChild(createScriptTa);
+    createScriptWrap.appendChild(createScriptTa);
     attachBottomBar(createScriptTa, 240, 60);
 
     const createImportRow = mk("div", "h3s-row");
@@ -3992,7 +4115,8 @@ function buildStudio(node) {
     });
     createImportRow.append(btnCreateParse, btnCreateParseCurrent, btnCreateLoad,
       mk("span", "h3s-hint", "角色图按文件名匹配：官方 Ref2VA 本地识别；普通剧本仅在本地匹配失败时调用 API"));
-    editor.appendChild(createImportRow);
+    createScriptWrap.appendChild(createImportRow);
+    editor.appendChild(createScriptWrap);
 
     /* 全局提示词（v2.12）：注入到每一段开头，保持风格/角色/场景一致性 */
     const gpRow = mk("div", "h3s-row");
@@ -4341,6 +4465,15 @@ function buildStudio(node) {
     picHintEl = mk("div", "h3s-pichint", picHintText(s, sel));
     editor.appendChild(picHintEl);
 
+    /* 创作界面与文本界面保持同一套提示词入口：标题明确当前区域，
+       “清空”只影响当前选中的段，不会动全段提示词或其它片段。 */
+    const promptHead = mk("div", "h3s-row");
+    promptHead.appendChild(mk("span", "h3s-hint", "提示词："));
+    const btnClearPrompt = mk("button", "h3s-btn", "清空");
+    btnClearPrompt.title = "清空当前段提示词";
+    promptHead.appendChild(btnClearPrompt);
+    editor.appendChild(promptHead);
+
     const ta = mk("textarea", "h3s-ta");
     ta.value = s.prompt;
     // 段级记忆提示词编辑区的手动尺寸；保存在 segments_json，随工作流恢复。
@@ -4352,6 +4485,15 @@ function buildStudio(node) {
       ta.style.height = Math.max(60, Math.round(Number(savedPromptBoxSize.height))) + "px";
     }
     ta.addEventListener("change", () => { s.prompt = ta.value; save(); });
+    btnClearPrompt.addEventListener("click", () => {
+      ta.value = "";
+      s.prompt = "";
+      save();
+      rebuildNav?.();
+      updateSL?.();
+      ta.focus();
+      status.textContent = "段" + (sel + 1) + " 提示词已清空";
+    });
     editor.appendChild(ta);
     attachBottomBar(ta, 240, 60, (width, height, finished) => {
       if (!finished) return;

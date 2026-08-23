@@ -243,7 +243,7 @@ def _resolve_export_directory(value):
     return os.path.realpath(raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw))
 
 
-def _export_signature(output_dir, filename_prefix, seg_idx, video_height):
+def _export_signature(output_dir, filename_prefix, seg_idx, video_short_side):
     directory = _resolve_export_directory(output_dir)
     if directory is None:
         return None
@@ -251,12 +251,12 @@ def _export_signature(output_dir, filename_prefix, seg_idx, video_height):
         "directory": directory,
         "prefix": _safe_export_prefix(filename_prefix),
         "segment": int(seg_idx),
-        "video_height": max(1, int(video_height)),
-        "rule": "prefix_height_timestamp_v3",
+        "video_short_side": max(1, int(video_short_side)),
+        "rule": "prefix_short_side_timestamp_v4",
     })
 
 
-def _export_segment_video(source_path, output_dir, filename_prefix, seg_idx, video_height,
+def _export_segment_video(source_path, output_dir, filename_prefix, seg_idx, video_short_side,
                           previous_meta=None, force=False):
     """Mirror a canonical segment MP4 into the user's delivery directory.
 
@@ -267,7 +267,7 @@ def _export_segment_video(source_path, output_dir, filename_prefix, seg_idx, vid
     directory = _resolve_export_directory(output_dir)
     if directory is None:
         return None, None, False
-    signature = _export_signature(output_dir, filename_prefix, seg_idx, video_height)
+    signature = _export_signature(output_dir, filename_prefix, seg_idx, video_short_side)
     prior = previous_meta if isinstance(previous_meta, dict) else {}
     prior_path = str(prior.get("export_path") or "")
     if (not force and prior.get("export_signature") == signature
@@ -276,9 +276,9 @@ def _export_segment_video(source_path, output_dir, filename_prefix, seg_idx, vid
 
     os.makedirs(directory, exist_ok=True)
     prefix = _safe_export_prefix(filename_prefix)
-    # 交付文件名使用当前段的实际输出高度；时间戳与既有规则保持一致。
-    # 同一分钟内同高度的多个片段仍由下方递增序号确保不会覆盖。
-    stem = "%s_%d_%s" % (prefix, max(1, int(video_height)), datetime.now().strftime("%Y%m%d_%H_%M"))
+    # 交付文件名使用当前段分辨率的短边（宽、高中的较小值）；时间戳规则保持一致。
+    # 同一分钟内短边相同的多个片段仍由下方递增序号确保不会覆盖。
+    stem = "%s_%d_%s" % (prefix, max(1, int(video_short_side)), datetime.now().strftime("%Y%m%d_%H_%M"))
     target = os.path.join(directory, stem + ".mp4")
     suffix = 2
     while os.path.exists(target):
@@ -1012,7 +1012,7 @@ class H3DirectorStudio:
                 "filename_prefix": ("STRING", {
                     "default": "ComfyUI",
                     "multiline": False,
-                    "tooltip": "文件名规则：前缀_当前段视频高度_年月日_时_分.mp4；同名时自动追加序号。"}),
+                    "tooltip": "文件名规则：前缀_当前段视频短边（宽高较小值）_年月日_时_分.mp4；同名时自动追加序号。"}),
                 "外部文本目标段": ("INT", {
                     "default": 1, "min": 1, "max": 9999, "step": 1,
                     "tooltip": "由导演台界面自动同步当前选中段，用于把外部文本送入正确的段。"}),
@@ -1714,7 +1714,7 @@ class H3DirectorStudio:
         report.append("MotionContext | 保存目录 %s | 加载目录 %s | 画面 %s 帧 | 音频 %d 帧" % (
             上下文保存目录 or "h3_context", 上下文加载目录 or "h3_context",
             MotionContext画面帧数, int(MotionContext音频帧数)))
-        report.append("成片导出 | 目录 %s | 命名 %s_视频高度_年月日_时_分.mp4" % (
+        report.append("成片导出 | 目录 %s | 命名 %s_视频短边_年月日_时_分.mp4" % (
             _resolve_export_directory(output_dir), filename_prefix))
         if 外部文本 is not None:
             report.append("外部文本：已连接并覆盖段%d提示词" % external_text_target)
@@ -1870,7 +1870,8 @@ class H3DirectorStudio:
             if os.path.exists(video_path):
                 try:
                     exported_path, export_sig, copied = _export_segment_video(
-                        video_path, output_dir, filename_prefix, seg_idx, _segment_sizes[k][1],
+                        video_path, output_dir, filename_prefix, seg_idx,
+                        min(_segment_sizes[k][0], _segment_sizes[k][1]),
                         previous_meta=meta_data, force=generated_now)
                 except Exception as e:
                     raise RuntimeError("[H3导演台] 段%d成片导出失败：%s" % (seg_idx, e)) from e
