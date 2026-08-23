@@ -252,7 +252,7 @@ def _export_signature(output_dir, filename_prefix, seg_idx, video_short_side):
         "prefix": _safe_export_prefix(filename_prefix),
         "segment": int(seg_idx),
         "video_short_side": max(1, int(video_short_side)),
-        "rule": "prefix_short_side_timestamp_v4",
+        "rule": "prefix_segment_short_side_timestamp_v5",
     })
 
 
@@ -276,9 +276,14 @@ def _export_segment_video(source_path, output_dir, filename_prefix, seg_idx, vid
 
     os.makedirs(directory, exist_ok=True)
     prefix = _safe_export_prefix(filename_prefix)
-    # 交付文件名使用当前段分辨率的短边（宽、高中的较小值）；时间戳规则保持一致。
-    # 同一分钟内短边相同的多个片段仍由下方递增序号确保不会覆盖。
-    stem = "%s_%d_%s" % (prefix, max(1, int(video_short_side)), datetime.now().strftime("%Y%m%d_%H_%M"))
+    # 交付文件名使用四位当前段号、当前段分辨率的短边（宽、高中的较小值）和时间戳。
+    # 同一分钟内同名的重新导出仍由下方递增序号确保不会覆盖。
+    stem = "%s_%04d_%d_%s" % (
+        prefix,
+        max(1, int(seg_idx)),
+        max(1, int(video_short_side)),
+        datetime.now().strftime("%Y%m%d_%H_%M"),
+    )
     target = os.path.join(directory, stem + ".mp4")
     suffix = 2
     while os.path.exists(target):
@@ -1012,7 +1017,7 @@ class H3DirectorStudio:
                 "filename_prefix": ("STRING", {
                     "default": "ComfyUI",
                     "multiline": False,
-                    "tooltip": "文件名规则：前缀_当前段视频短边（宽高较小值）_年月日_时_分.mp4；同名时自动追加序号。"}),
+                    "tooltip": "文件名规则：前缀_当前片段数（4位）_当前段视频短边（宽高较小值）_年月日_时_分.mp4；同名时自动追加序号。"}),
                 "外部文本目标段": ("INT", {
                     "default": 1, "min": 1, "max": 9999, "step": 1,
                     "tooltip": "由导演台界面自动同步当前选中段，用于把外部文本送入正确的段。"}),
@@ -1714,7 +1719,7 @@ class H3DirectorStudio:
         report.append("MotionContext | 保存目录 %s | 加载目录 %s | 画面 %s 帧 | 音频 %d 帧" % (
             上下文保存目录 or "h3_context", 上下文加载目录 or "h3_context",
             MotionContext画面帧数, int(MotionContext音频帧数)))
-        report.append("成片导出 | 目录 %s | 命名 %s_视频短边_年月日_时_分.mp4" % (
+        report.append("成片导出 | 目录 %s | 命名 %s_片段号(4位)_视频短边_年月日_时_分.mp4" % (
             _resolve_export_directory(output_dir), filename_prefix))
         if 外部文本 is not None:
             report.append("外部文本：已连接并覆盖段%d提示词" % external_text_target)
