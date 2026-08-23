@@ -1210,7 +1210,7 @@ function buildStudio(node) {
   if (textSharedRefsWidget) { textSharedRefsWidget.hidden = true; textSharedRefsWidget.computeSize = () => [0, -4]; }
   if (externalTextTargetWidget) { externalTextTargetWidget.hidden = true; externalTextTargetWidget.computeSize = () => [0, -4]; }
 
-  const summaryChoices = ["仅预览帧(推荐)", "完整帧和音频(高内存)"];
+  const summaryChoices = ["仅预览帧(推荐)", "单段视频输出", "完整帧和音频(高内存)"];
   const normalizeSummaryWidget = () => {
     if (!summaryWidget) return;
     if (!summaryChoices.includes(summaryWidget.value)) summaryWidget.value = summaryChoices[0];

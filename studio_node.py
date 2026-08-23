@@ -365,6 +365,20 @@ def _upstream_fingerprint(prompt, unique_id, input_name):
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def _output_connected(prompt, unique_id, output_index):
+    if not isinstance(prompt, dict):
+        return False
+    source_id = str(unique_id)
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        for value in (node.get("inputs") or {}).values():
+            if isinstance(value, list) and len(value) == 2 \
+                    and str(value[0]) == source_id and value[1] == output_index:
+                return True
+    return False
+
+
 def _upstream_model_kind(prompt, unique_id, input_name="model"):
     """只读检查模型输入的上游节点，识别 FL2VA / Ref2VA。
 
@@ -785,7 +799,7 @@ def _read_segment_video(seg, mode="create", project_id="default", target_size=No
         raise RuntimeError("[H3导演台] 无法读取缓存段视频: " + path)
     source_count = len(frames)
     arr = np.stack(frames)
-    if abs(source_fps - target_fps) > 0.01:
+    if target_fps is not None and abs(source_fps - target_fps) > 0.01:
         target_count = max(1, round(source_count * target_fps / source_fps))
         indices = np.minimum((np.arange(target_count) * source_fps / target_fps).astype(np.int64), source_count - 1)
         arr = arr[indices]
@@ -810,7 +824,8 @@ def _read_segment_video(seg, mode="create", project_id="default", target_size=No
         sr, ch = 32000, 2
         n_silent = max(1, int(round(source_count / source_fps * sr)))
         a = np.zeros((ch, n_silent), dtype=np.float32)
-    return torch.from_numpy(arr), {"waveform": torch.from_numpy(a)[None,], "sample_rate": sr}
+    return torch.from_numpy(arr), {"waveform": torch.from_numpy(a)[None,], "sample_rate": sr,
+                                   "fps": max(1, round(source_fps))}
 
 
 def _read_segment_preview(seg, mode="create", project_id="default", target_size=None):
@@ -880,7 +895,7 @@ class H3DirectorStudio:
                     "tooltip": "裁剪 Motion Context 前缀后，让音频长度精确匹配画面。"}),
                 # 末尾空字符串只用于兼容从 2.13.x 升级、尚未被前端迁移的旧工作流。
                 # 默认仍是第一项；前端加载后会立即把空值改成“仅预览帧”。
-                "汇总输出": (["仅预览帧(推荐)", "完整帧和音频(高内存)", ""],
+                "汇总输出": (["仅预览帧(推荐)", "单段视频输出", "完整帧和音频(高内存)", ""],
                              {"default": "仅预览帧(推荐)"}),
                 "project_id": ("STRING", {"default": ""}),
                 "text_shared_refs_json": ("STRING", {"default": "[]", "multiline": True}),
@@ -916,9 +931,9 @@ class H3DirectorStudio:
             },
         }
 
-    # 新输出追加在末尾，保持旧工作流前五个输出的插槽编号不变。
-    RETURN_TYPES = ("IMAGE", "AUDIO", "INT", "INT", "STRING", "INT")
-    RETURN_NAMES = ("images", "audio", "fps", "frame_count", "report", "segment_number")
+    # 新输出追加在末尾，保持旧工作流的插槽编号不变。
+    RETURN_TYPES = ("IMAGE", "AUDIO", "INT", "INT", "STRING", "INT", "LATENT", "CONDITIONING", "NOISE")
+    RETURN_NAMES = ("images", "audio", "fps", "frame_count", "report", "segment_number", "latent", "positive", "noise")
     FUNCTION = "direct"
     CATEGORY = CATEGORY
     OUTPUT_NODE = True
@@ -931,7 +946,8 @@ class H3DirectorStudio:
                       primary_model_kind="unknown", context_save_dir="h3_context",
                       context_load_dir="h3_context", context_length="22",
                       audio_context_length=24, context_match_tail=True,
-                      external_sigmas=None, save_context_latent=True):
+                      external_sigmas=None, save_context_latent=True,
+                      return_internal_outputs=False):
         # 0) 计算本段时长与帧数（缺失时用节点默认时长），帧数对齐 ≡5 (mod 17)
         # 段级分辨率覆盖（v2.8）：每段视频尺寸可不同；留空=跟随节点宽高
         _wo = int(seg_cfg.get("width") or 0)
@@ -1321,6 +1337,9 @@ class H3DirectorStudio:
             noise.generate_noise(latent), latent_image, sampler, sigmas,
             callback=callback, disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=noise.seed)
         samples = samples.to(comfy.model_management.intermediate_device())
+        output_latent = {"samples": samples} if return_internal_outputs else None
+        output_positive = cond if return_internal_outputs else None
+        output_noise = noise if return_internal_outputs else None
 
         # 无论 MotionContext 段级开关是否开启，每个已生成段都保存 H3 AV latent。
         # clip_index 使用真实段号；重跑同一段只覆盖自己的主存储固定槽位。
@@ -1401,7 +1420,7 @@ class H3DirectorStudio:
 
         del frames_u8, audio
         gc.collect()
-        return out_path, audio_samples
+        return out_path, audio_samples, output_latent, output_positive, output_noise
 
     # ---------------- 主流程 ----------------
     def direct(self, model, clip, vae, audio_vae, width, height, 时长秒, steps,
@@ -1537,6 +1556,12 @@ class H3DirectorStudio:
 
         project_id = _safe_project_id(project_id or ("node_" + str(h3_unique_id or "default")))
         os.makedirs(_project_dir(project_id), exist_ok=True)
+        need_internal_outputs = any(
+            _output_connected(h3_prompt_graph, h3_unique_id, output_index)
+            for output_index in (6, 7, 8))
+        output_latent = None
+        output_positive = None
+        output_noise = None
 
         shared_refs = []
         shared_ref_names = []
@@ -1694,11 +1719,12 @@ class H3DirectorStudio:
                 meta_ok = False
 
             generated_now = False
-            if meta_ok and not seg_cfg.get("force"):
+            return_internal_outputs = need_internal_outputs and seg_idx == external_text_target
+            if meta_ok and not seg_cfg.get("force") and not return_internal_outputs:
                 report.append("段%d: 缓存命中%s，跳过生成" % (
                     seg_idx, "（clip %d 已存在）" % save_context_index if save_context_latent else ""))
             else:
-                video_path, _ = self._run_segment(
+                video_path, _, segment_latent, segment_positive, segment_noise = self._run_segment(
                     seg_idx, seg_cfg, shared_refs, model, fl2va_model, clip, vae, audio_vae,
                     width, height, 时长秒, steps, sampler, scheduler, ref_image_size, mode,
                     global_prompt,
@@ -1710,7 +1736,12 @@ class H3DirectorStudio:
                     audio_context_length=MotionContext音频帧数,
                     context_match_tail=MotionContext匹配尾部,
                     external_sigmas=外部SIGMAS,
-                    save_context_latent=save_context_latent)
+                    save_context_latent=save_context_latent,
+                    return_internal_outputs=return_internal_outputs)
+                if return_internal_outputs:
+                    output_latent = segment_latent
+                    output_positive = segment_positive
+                    output_noise = segment_noise
                 generated_now = True
                 meta_data = {
                     "schema": CACHE_SCHEMA,
@@ -1744,6 +1775,9 @@ class H3DirectorStudio:
 
         # （按用户要求已移除自动合并：每段独立成片，不再生成 漫剧_60s_合并.mp4）
 
+        if need_internal_outputs and output_latent is None:
+            raise ValueError("[H3导演台] 当前选中段%d未生成，无法输出 latent 和 positive。请选中已启用的段后运行。" % external_text_target)
+
         if str(汇总输出).startswith("完整"):
             all_frames = []
             all_wavs = []
@@ -1771,6 +1805,16 @@ class H3DirectorStudio:
                 sr = 32000
                 waveform = torch.zeros((1, 2, 1))
             frame_count = images.shape[0]
+        elif 汇总输出 == "单段视频输出":
+            if external_text_target not in done:
+                raise ValueError("[H3导演台] 当前选中段%d未生成，无法输出单段视频。请选中已启用的段后运行。" % external_text_target)
+            images, segment_audio = _read_segment_video(
+                external_text_target, mode, project_id, target_fps=None)
+            waveform = segment_audio["waveform"]
+            sr = int(segment_audio["sample_rate"])
+            frame_count = images.shape[0]
+            fps = int(segment_audio["fps"])
+            report.append("汇总输出为单段视频：段%d的完整画面与音频已按原分辨率、原帧率输出" % external_text_target)
         else:
             images = torch.zeros((1, height, width, 3))
             frame_count = 0
@@ -1784,7 +1828,9 @@ class H3DirectorStudio:
         report.append("本次新生成段: %s" % (",".join(map(str, ran)) if ran else "无（全部缓存）"))
         report.append("当前选中段编号: %d" % external_text_target)
         _log("[H3导演台] 完成。新生成 %s，合并段 %s" % (ran, done))
-        return (images, audio, FPS, frame_count, "\n".join(report), int(external_text_target))
+        return (images, audio, fps if 汇总输出 == "单段视频输出" else FPS,
+                frame_count, "\n".join(report), int(external_text_target),
+                output_latent, output_positive, output_noise)
 
 
 NODE_CLASS_MAPPINGS = {"H3DirectorStudio": H3DirectorStudio}
