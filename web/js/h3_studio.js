@@ -4,7 +4,7 @@ import { H3_TEXT_TEMPLATES } from "./h3_templates.js";
 
 /* 前端版本号：与 routes.py 的 BACKEND_VERSION 对应。
    status 接口返回的后端版本若与此不一致（用户改了代码但没重启/没强刷），状态栏红字提示。 */
-const H3S_VERSION = "2.22.0";
+const H3S_VERSION = "2.25.2";
 const activeProjectIds = new Map();
 
 function newProjectId() {
@@ -177,6 +177,49 @@ const DRAG_PX_PER_SEC = 12;
 const DUR_MIN = 1.6;
 const DUR_MAX = 15;
 
+/* 与 ComfyUI 内置 Resolution Selector（comfy_extras/nodes_resolution.py）完全一致。 */
+const H3S_ASPECT_RATIOS = {
+  "1:1 (Square)": [1, 1],
+  "2:3 (Portrait Photo)": [2, 3],
+  "3:2 (Photo)": [3, 2],
+  "3:4 (Portrait Standard)": [3, 4],
+  "4:3 (Standard)": [4, 3],
+  "9:16 (Portrait Widescreen)": [9, 16],
+  "16:9 (Widescreen)": [16, 9],
+  "21:9 (Ultrawide)": [21, 9],
+};
+const H3S_DEFAULT_ASPECT = "16:9 (Widescreen)";
+const H3S_DEFAULT_MEGAPIXELS = 0.5;
+const H3S_DEFAULT_MULTIPLE = 32;
+
+function calculateSegmentResolution(aspectRatio, megapixels, multiple) {
+  const ratio = H3S_ASPECT_RATIOS[aspectRatio] || H3S_ASPECT_RATIOS[H3S_DEFAULT_ASPECT];
+  const mp = Math.round(Math.min(16, Math.max(0.1,
+    Number(megapixels) || H3S_DEFAULT_MEGAPIXELS)) * 10) / 10;
+  const mul = Math.min(128, Math.max(8, Math.round(Number(multiple) || H3S_DEFAULT_MULTIPLE)));
+  const pyRound = (value) => {
+    const lower = Math.floor(value);
+    const fraction = value - lower;
+    if (Math.abs(fraction - 0.5) < 1e-10) return lower % 2 === 0 ? lower : lower + 1;
+    return Math.round(value);
+  };
+  const scale = Math.sqrt(mp * 1024 * 1024 / (ratio[0] * ratio[1]));
+  return [Math.max(mul, pyRound(ratio[0] * scale / mul) * mul),
+    Math.max(mul, pyRound(ratio[1] * scale / mul) * mul)];
+}
+
+function defaultResolutionFields() {
+  const [width, height] = calculateSegmentResolution(
+    H3S_DEFAULT_ASPECT, H3S_DEFAULT_MEGAPIXELS, H3S_DEFAULT_MULTIPLE);
+  return {
+    aspect_ratio: H3S_DEFAULT_ASPECT,
+    megapixels: H3S_DEFAULT_MEGAPIXELS,
+    multiple: H3S_DEFAULT_MULTIPLE,
+    width,
+    height,
+  };
+}
+
 const DEFAULT_PROMPT_FIRST =
   "A 10-second opening clip of a comic-drama episode. <Picture 1>, <Picture 2> and <Picture 3> define the characters' appearance, outfits and the scene - keep them perfectly consistent.\n\nEvery shot is framed in MEDIUM SHOT or MEDIUM CLOSE-UP (waist-up). The camera NEVER pulls back to a wide or long shot.\n\n[0s-3s] ...\n[3s-7s] ...\n[7s-10s] ...\n\nAudio: ambient sound + character voices + soft BGM. No subtitles on screen.\nConstraints: keep the exact appearance from the reference images. Medium-shot framing only, no new characters, no scene changes, no text overlays.";
 const DEFAULT_PROMPT_NEXT =
@@ -189,11 +232,12 @@ function defaultSegs() {
       prompt: i === 0 ? DEFAULT_PROMPT_FIRST : DEFAULT_PROMPT_NEXT,
       seed: 916261814925780 + (i + 1) * 777,
       refs: [],
+      ...defaultResolutionFields(),
       duration: 10,
       inherit_shared: true,
       generation_mode: "multi_ref",
       use_tail: false,
-      motion_context: i > 0,
+      motion_context: false,
       motion_context_source: "local_latent",
       enabled: true,
       force: false,
@@ -208,10 +252,13 @@ function defaultTextSegs() {
     prompt: "",
     seed: Math.floor(Math.random() * 1e15),
     refs: [],
+    ...defaultResolutionFields(),
     duration: 10,
     inherit_shared: true,
-    use_tail: true,
+    use_tail: false,
     motion_context: false,
+    motion_context_source: "local_latent",
+    motion_context_index: 0,
     enabled: true,
     force: false,
   }];
@@ -1255,23 +1302,118 @@ function buildStudio(node) {
   let textSegs = defaultTextSegs();           // 文本界面=纯提示词工作区（v2.11）
   let segs = createSegs;
   const curMode = () => node.properties.h3_mode || "create";
+  const nodeDefaultDimensions = () => {
+    const ww = node.widgets.find((w) => w.name === "width");
+    const hw = node.widgets.find((w) => w.name === "height");
+    return [Math.max(32, Number(ww && ww.value) || 832), Math.max(32, Number(hw && hw.value) || 480)];
+  };
+  const closestAspect = (width, height) => {
+    const target = Math.max(0.0001, Number(width) / Math.max(1, Number(height)));
+    let best = H3S_DEFAULT_ASPECT;
+    let bestError = Infinity;
+    for (const [name, ratio] of Object.entries(H3S_ASPECT_RATIOS)) {
+      const error = Math.abs(Math.log(target / (ratio[0] / ratio[1])));
+      if (error < bestError) { best = name; bestError = error; }
+    }
+    return best;
+  };
+  const normalizeSegmentResolution = (seg) => {
+    if (!seg || typeof seg !== "object") return [832, 480];
+    const defaults = nodeDefaultDimensions();
+    const existingWidth = Number(seg.width) > 0 ? Number(seg.width) : defaults[0];
+    const existingHeight = Number(seg.height) > 0 ? Number(seg.height) : defaults[1];
+    if (!H3S_ASPECT_RATIOS[seg.aspect_ratio]) {
+      seg.aspect_ratio = closestAspect(existingWidth, existingHeight);
+    }
+    const mp = Number(seg.megapixels);
+    seg.megapixels = Math.round((Number.isFinite(mp) && mp >= 0.1
+      ? Math.min(16, mp)
+      : Math.min(16, Math.max(0.1, existingWidth * existingHeight / (1024 * 1024)))) * 10) / 10;
+    const multiple = Number(seg.multiple);
+    seg.multiple = Math.min(128, Math.max(8,
+      Math.round(Number.isFinite(multiple) ? multiple : H3S_DEFAULT_MULTIPLE)));
+    const dims = calculateSegmentResolution(seg.aspect_ratio, seg.megapixels, seg.multiple);
+    seg.width = dims[0];
+    seg.height = dims[1];
+    return dims;
+  };
+  const segmentContinuityBlocked = (items, idx) => {
+    if (!Array.isArray(items) || idx <= 0 || !items[idx] || !items[idx - 1]) return false;
+    const previous = normalizeSegmentResolution(items[idx - 1]);
+    const current = normalizeSegmentResolution(items[idx]);
+    return items[idx - 1].aspect_ratio !== items[idx].aspect_ratio
+      || previous[0] !== current[0] || previous[1] !== current[1];
+  };
+  const normalizeResolutionContinuity = (items) => {
+    if (!Array.isArray(items)) return;
+    items.forEach((seg) => normalizeSegmentResolution(seg));
+    items.forEach((seg, idx) => {
+      if (!segmentContinuityBlocked(items, idx)) return;
+      if (seg.motion_context === true) {
+        syncSegmentToPrevious(items, idx);
+        seg.use_tail = false;
+      } else {
+        seg.use_tail = false;
+        seg.motion_context = false;
+      }
+    });
+  };
+  const syncSegmentToPrevious = (items, idx) => {
+    if (!Array.isArray(items) || idx <= 0 || !items[idx] || !items[idx - 1]) return null;
+    const previous = items[idx - 1];
+    const current = items[idx];
+    normalizeSegmentResolution(previous);
+    for (const key of ["aspect_ratio", "megapixels", "multiple", "width", "height"]) {
+      current[key] = previous[key];
+    }
+    const previousFps = Number(previous.fps);
+    current.fps = Number.isFinite(previousFps)
+      ? Math.min(24, Math.max(8, Math.round(previousFps))) : 24;
+    return [current.width, current.height, current.fps];
+  };
   const normalizeContinuityModes = (items) => {
     if (!Array.isArray(items)) return;
     items.forEach((seg, idx) => {
-      if (idx === 0) {
-        seg.use_tail = false;
-        seg.motion_context = false;
-      } else if (seg.motion_context === true) {
+      if (seg.motion_context === true) {
         if (!["local_latent", "upload_latent", "video"].includes(seg.motion_context_source)) {
           seg.motion_context_source = "local_latent";
+        }
+        if (seg.motion_context_source === "local_latent") {
+          const index = Number(seg.motion_context_index);
+          seg.motion_context_index = Number.isFinite(index) && index >= 0
+            ? Math.min(9998, Math.floor(index)) : idx;
         }
         seg.motion_context = true;
         seg.use_tail = false;
       } else {
         seg.motion_context = false;
-        seg.use_tail = true;
+        seg.use_tail = seg.use_tail === true;
       }
     });
+  };
+  const appendLocalMotionIndex = (row, seg, segmentIndex) => {
+    if (seg.motion_context !== true) return;
+    if (!["local_latent", "upload_latent", "video"].includes(seg.motion_context_source)) {
+      seg.motion_context_source = "local_latent";
+    }
+    if (seg.motion_context_source !== "local_latent") return;
+    const label = mk("span", "h3s-hint", "Clip_index");
+    const input = mk("input", "h3s-durinput");
+    input.type = "number";
+    input.min = "0";
+    input.max = "9998";
+    input.step = "1";
+    const current = Number(seg.motion_context_index);
+    input.value = String(Number.isFinite(current) && current >= 0 ? Math.floor(current) : segmentIndex);
+    input.title = "读取 clip 的编号。0=不读取旧 latent；本段生成后保存为 clip_(Index+1)。";
+    input.addEventListener("change", () => {
+      const parsed = Math.floor(Number(input.value));
+      seg.motion_context_index = Number.isFinite(parsed)
+        ? Math.min(9998, Math.max(0, parsed)) : segmentIndex;
+      input.value = String(seg.motion_context_index);
+      save();
+    });
+    row.append(label, input, mk("span", "h3s-hint", "0=不加载；本段保存 clip " + (Number(input.value) + 1)));
   };
   const _modeQ = () => new URLSearchParams({ mode: curMode(), project_id: ensureProjectId() }).toString();
   const migrateTextRefs = () => {
@@ -1311,12 +1453,81 @@ function buildStudio(node) {
     normalizeContinuityModes(createSegs);
     normalizeContinuityModes(videoSegs);
     normalizeContinuityModes(textSegs);
+    normalizeResolutionContinuity(createSegs);
+    normalizeResolutionContinuity(videoSegs);
+    normalizeResolutionContinuity(textSegs);
     jsonWidget.value = JSON.stringify(createSegs);
     if (vJsonWidget) vJsonWidget.value = JSON.stringify(videoSegs);
     if (tJsonWidget) tJsonWidget.value = JSON.stringify(textSegs);
     if (textSharedRefsWidget) textSharedRefsWidget.value = JSON.stringify(node.properties.h3_text_refs || []);
     if (modeWidget) modeWidget.value = curMode();
     syncLowVramButton();
+  };
+  const appendResolutionControls = (row, seg) => {
+    normalizeSegmentResolution(seg);
+    const group = mk("span", null);
+    group.style.cssText = "display:inline-flex;align-items:center;gap:5px;flex-wrap:nowrap;white-space:nowrap;";
+    group.appendChild(mk("span", "h3s-hint", "宽高比"));
+    const aspect = document.createElement("select");
+    aspect.className = "h3s-seedmode";
+    aspect.style.width = "164px";
+    for (const name of Object.keys(H3S_ASPECT_RATIOS)) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      aspect.appendChild(option);
+    }
+    aspect.value = seg.aspect_ratio;
+    aspect.title = "本段独立宽高比；算法与 ComfyUI 的“分辨率 和像素”节点一致";
+
+    group.appendChild(aspect);
+    group.appendChild(mk("span", "h3s-hint", "百万像素"));
+    const megapixels = mk("input", "h3s-durinput");
+    megapixels.type = "number";
+    megapixels.min = "0.1";
+    megapixels.max = "16";
+    megapixels.step = "0.1";
+    megapixels.style.width = "62px";
+    megapixels.value = Number(seg.megapixels).toFixed(1);
+    megapixels.addEventListener("input", () => {
+      const raw = String(megapixels.value || "");
+      const dot = raw.indexOf(".");
+      if (dot >= 0 && raw.length > dot + 2) megapixels.value = raw.slice(0, dot + 2);
+    });
+
+    group.appendChild(megapixels);
+    group.appendChild(mk("span", "h3s-hint", "倍数"));
+    const multiple = mk("input", "h3s-durinput");
+    multiple.type = "number";
+    multiple.min = "8";
+    multiple.max = "128";
+    multiple.step = "4";
+    multiple.style.width = "52px";
+    multiple.value = String(seg.multiple);
+    const dimensions = mk("span", "h3s-hint", `${seg.width}×${seg.height}`);
+    dimensions.style.color = "#9fd0ff";
+    group.append(multiple, dimensions);
+
+    const commit = () => {
+      seg.aspect_ratio = aspect.value;
+      seg.megapixels = Math.round(Math.min(16, Math.max(0.1,
+        Number(megapixels.value) || H3S_DEFAULT_MEGAPIXELS)) * 10) / 10;
+      seg.multiple = Math.min(128, Math.max(8,
+        Math.round(Number(multiple.value) || H3S_DEFAULT_MULTIPLE)));
+      const dims = normalizeSegmentResolution(seg);
+      const hadBlockedContinuity = segs.some((item, idx) => idx > 0
+        && segmentContinuityBlocked(segs, idx) && (item.use_tail === true || item.motion_context === true));
+      normalizeResolutionContinuity(segs);
+      save();
+      status.textContent = `段${sel + 1} 分辨率：${dims[0]}×${dims[1]}`
+        + (hadBlockedContinuity ? "；尺寸不同的段已关闭尾帧续接和 MotionContext" : "");
+      renderTimeline();
+      renderEditor();
+    };
+    aspect.addEventListener("change", commit);
+    megapixels.addEventListener("change", commit);
+    multiple.addEventListener("change", commit);
+    row.appendChild(group);
   };
   const reloadFromWidget = () => {
     normalizeSummaryWidget();
@@ -1732,6 +1943,7 @@ function buildStudio(node) {
       seed: Math.floor(Math.random() * 1e15),
       refs: [],
       video_refs: [],
+      ...defaultResolutionFields(),
       duration: _defDur,
       inherit_shared: true,
       use_tail: false,
@@ -1886,19 +2098,20 @@ function buildStudio(node) {
   });
   btnTailAll.addEventListener("click", () => {
     segs.forEach((s, idx) => {
-      s.use_tail = idx > 0;
+      s.use_tail = idx > 0 && !segmentContinuityBlocked(segs, idx);
       s.motion_context = false;
     });
     save(); renderTimeline(); renderEditor();
-    status.textContent = "段2以后已全部切换为「续接上段尾帧」";
+    status.textContent = "同分辨率的段已切换为「续接上段尾帧」；尺寸不同的段保持禁用";
   });
   btnTailNone.addEventListener("click", () => {
     segs.forEach((s, idx) => {
       s.use_tail = false;
+      if (idx > 0) syncSegmentToPrevious(segs, idx);
       s.motion_context = idx > 0;
     });
     save(); renderTimeline(); renderEditor();
-    status.textContent = "段2以后已全部切换为 MotionContext";
+    status.textContent = "段2以后已切换为 MotionContext，并逐段同步上段的比例、分辨率和帧率";
   });
 
   function updateTotal() {
@@ -2203,6 +2416,7 @@ function buildStudio(node) {
     cb.addEventListener("change", () => { s.enabled = cb.checked; save(); renderTimeline(); });
     row0.appendChild(cb);
     row0.appendChild(mk("span", null, "启用"));
+    appendResolutionControls(row0, s);
     row0.appendChild(mk("span", "h3s-hint", "时长（秒）："));
     const durW = node.widgets.find((w) => w.name === "时长秒");  // 节点默认值（新建段用）
     const din = mk("input", "h3s-durinput");
@@ -2232,48 +2446,6 @@ function buildStudio(node) {
     row0.appendChild(din);
     row0.appendChild(btnMinus);
     row0.appendChild(btnPlus);
-    /* 段级分辨率（v2.8）：每段视频尺寸不同；留空=跟随节点宽高；"按视频"自动匹配参考视频 */
-    row0.appendChild(mk("span", "h3s-hint", "分辨率"));
-    const snap32 = (v) => Math.max(256, Math.min(1920, Math.round(v / 32) * 32));
-    const wIn = mk("input", "h3s-durinput");
-    const hIn = mk("input", "h3s-durinput");
-    for (const pair of [[wIn, "width", "宽"], [hIn, "height", "高"]]) {
-      const inp = pair[0], key = pair[1];
-      inp.type = "number";
-      inp.step = "32";
-      inp.min = "256";
-      inp.max = "1920";
-      inp.value = s[key] ? String(s[key]) : "";
-      inp.placeholder = pair[2];
-      inp.title = "留空=跟随节点宽高；改动自动取整到 32 的倍数";
-      inp.addEventListener("change", () => {
-        if (inp.value === "") { delete s[key]; }
-        else { s[key] = snap32(Number(inp.value) || 0); inp.value = String(s[key]); }
-        save();
-      });
-    }
-    const btnFit = mk("button", "h3s-btn", "按视频");
-    btnFit.title = "自动读取参考视频的尺寸并取整到 32 的倍数（竖屏视频必点）";
-    btnFit.addEventListener("click", () => {
-      const cur = (s.video_refs || [])[0];
-      if (!cur) { status.textContent = "先在下方加载参考视频"; return; }
-      const tv = document.createElement("video");
-      tv.preload = "metadata";
-      tv.src = api.apiURL("/view?filename=" + encodeURIComponent(cur) + "&type=input");
-      tv.addEventListener("loadedmetadata", () => {
-        s.width = snap32(tv.videoWidth);
-        s.height = snap32(tv.videoHeight);
-        wIn.value = String(s.width);
-        hIn.value = String(s.height);
-        save();
-        status.textContent = "分辨率已匹配参考视频：" + tv.videoWidth + "x" + tv.videoHeight + " → " + s.width + "x" + s.height;
-      });
-      tv.addEventListener("error", () => { status.textContent = "读取视频尺寸失败"; });
-    });
-    row0.appendChild(wIn);
-    row0.appendChild(mk("span", "h3s-hint", "×"));
-    row0.appendChild(hIn);
-    row0.appendChild(btnFit);
     /* 种子（v2.9.2）：-1=每次随机；🎲 固定一个随机种子复刻同款 */
     row0.appendChild(mk("span", "h3s-hint", "种子"));
     const seedModeSel = mk("select", "h3s-seedmode");
@@ -2321,37 +2493,46 @@ function buildStudio(node) {
     row0.appendChild(seedModeSel);
     row0.appendChild(seedIn);
     row0.appendChild(btnDice);
+    const continuityBlocked = segmentContinuityBlocked(segs, sel);
     const continuityName = `h3-cont-${node.id}-video-${sel}`;
     const cbTail = document.createElement("input");
     cbTail.type = "checkbox";
     cbTail.name = continuityName;
-    cbTail.checked = sel > 0 && s.use_tail === true;
-    cbTail.disabled = sel === 0;
-    cbTail.title = sel === 0 ? "段1 没有上一段" : "只使用上一段尾帧续接，自动关闭 MotionContext";
+    cbTail.checked = !continuityBlocked && s.use_tail === true;
+    cbTail.disabled = continuityBlocked;
+    cbTail.title = continuityBlocked ? "本段与上段分辨率不同，禁止续接尾帧" : "续接上段尾帧；选择后自动关闭 MotionContext，也可再次取消";
     cbTail.addEventListener("change", () => {
-      if (!cbTail.checked) { cbTail.checked = true; return; }
-      s.use_tail = true; s.motion_context = false; save(); renderEditor();
+      s.use_tail = cbTail.checked;
+      if (cbTail.checked) s.motion_context = false;
+      save(); renderEditor();
     });
     row0.appendChild(cbTail);
     const tailModeLab = mk("span", null, "续接上段尾帧");
-    if (sel === 0) tailModeLab.style.opacity = "0.5";
+    if (continuityBlocked) tailModeLab.style.opacity = "0.45";
     row0.appendChild(tailModeLab);
     const cbMotion = document.createElement("input");
     cbMotion.type = "checkbox";
     cbMotion.name = continuityName;
-    cbMotion.checked = sel > 0 && s.motion_context === true;
-    cbMotion.disabled = sel === 0;
-    cbMotion.title = sel === 0
-      ? "段1 没有上一段 clip，始终绕过 Motion Context"
-      : "只使用上一段 Motion Context clip，自动关闭尾帧续接；本段仍保存 clip";
+    cbMotion.checked = !continuityBlocked && s.motion_context === true;
+    cbMotion.disabled = false;
+    cbMotion.title = continuityBlocked ? "勾选后自动同步上段的宽高比、分辨率和帧率，再开启 MotionContext" : "选择后自动关闭尾帧续接；同时同步上段的宽高比、分辨率和帧率";
     cbMotion.addEventListener("change", () => {
-      if (!cbMotion.checked) { cbMotion.checked = true; return; }
-      s.motion_context = true; s.use_tail = false; save(); renderEditor();
+      s.motion_context = cbMotion.checked;
+      if (cbMotion.checked) {
+        const synced = syncSegmentToPrevious(segs, sel);
+        s.use_tail = false;
+        if (!Number.isFinite(Number(s.motion_context_index)) || Number(s.motion_context_index) < 0) {
+          s.motion_context_index = sel;
+        }
+        if (synced) status.textContent = `MotionContext 已开启：本段已同步为 ${synced[0]}×${synced[1]} / ${synced[2]}fps`;
+      }
+      save(); renderEditor();
     });
     row0.appendChild(cbMotion);
     const motionLab = mk("span", null, "MotionContext");
-    if (sel === 0) motionLab.style.opacity = "0.5";
     row0.appendChild(motionLab);
+    if (continuityBlocked) row0.appendChild(mk("span", "h3s-audio-warn", "尾帧续接已禁用；勾选 MotionContext 会自动同步上段尺寸和帧率"));
+    appendLocalMotionIndex(row0, s, sel);
     row0.appendChild(mk("span", "h3s-hint", "每段=上方照片+下方参考视频，建议时长 ≤ 参考视频时长"));
     editor.appendChild(row0);
 
@@ -2661,9 +2842,13 @@ function buildStudio(node) {
           prompt: p.prompt,
           seed: Math.floor(Math.random() * 1e15),
           refs: [],
+          ...defaultResolutionFields(),
           duration: p.duration > 0 ? p.duration : clampDur(_defDur),
           inherit_shared: true,
-          use_tail: i > 0,   // 段1 无尾帧可续；后续段默认续接
+          use_tail: false,
+          motion_context: false,
+          motion_context_source: "local_latent",
+          motion_context_index: i,
           enabled: true,
           force: false,
         });
@@ -2732,13 +2917,17 @@ function buildStudio(node) {
       if (!parsed.length) { status.textContent = "没有识别到任何内容"; return; }
       const _durW = node.widgets.find((w) => w.name === "时长秒");
       const _defDur = _durW ? (Number(_durW.value) || 10) : 10;
-      const newSegs = parsed.map((p) => ({
+      const newSegs = parsed.map((p, i) => ({
         prompt: p.prompt,
         seed: Math.floor(Math.random() * 1e15),
         refs: [],
+        ...defaultResolutionFields(),
         duration: p.duration > 0 ? p.duration : clampDur(_defDur),
         inherit_shared: true,
-        use_tail: true,
+        use_tail: false,
+        motion_context: false,
+        motion_context_source: "local_latent",
+        motion_context_index: sel + i,
         enabled: true,
         force: false,
       }));
@@ -2929,6 +3118,7 @@ function buildStudio(node) {
     cb.addEventListener("change", () => { s.enabled = cb.checked; save(); renderTimeline(); });
     row0.appendChild(cb);
     row0.appendChild(mk("span", null, "启用"));
+    appendResolutionControls(row0, s);
     row0.appendChild(mk("span", "h3s-hint", "时长（秒）："));
     const din = mk("input", "h3s-durinput");
     din.type = "number";
@@ -2956,8 +3146,7 @@ function buildStudio(node) {
     row0.appendChild(din);
     row0.appendChild(btnMinus);
     row0.appendChild(btnPlus);
-    /* v2.11.1：帧率/分辨率控件已按用户要求从文本界面移除——帧率恒 24（H3 原生），
-       分辨率跟随节点宽高（后端段级 width/height 覆盖路径保留，手改 JSON 仍可用） */
+    /* 帧率恒为 H3 原生 24；分辨率改由本段上方 Resolution Selector 独立计算。 */
     /* 种子：-1=每次随机；🎲 固定一个随机种子复刻同款 */
     row0.appendChild(mk("span", "h3s-hint", "种子"));
     const seedModeSel = mk("select", "h3s-seedmode");
@@ -3003,37 +3192,46 @@ function buildStudio(node) {
     row0.appendChild(seedIn);
     row0.appendChild(btnDice);
     /* 文本界面续接方式：尾帧与 MotionContext 二选一。 */
+    const continuityBlocked = segmentContinuityBlocked(segs, sel);
     const cbTail = document.createElement("input");
     const continuityName = `h3-cont-${node.id}-text-${sel}`;
     cbTail.type = "checkbox";
     cbTail.name = continuityName;
-    cbTail.checked = sel > 0 && s.use_tail === true;
-    cbTail.disabled = sel === 0;
-    cbTail.title = sel === 0 ? "段1 没有上一段尾帧" : "以上一段视频的尾帧作为本段起点（跨段动作连续）";
+    cbTail.checked = !continuityBlocked && s.use_tail === true;
+    cbTail.disabled = continuityBlocked;
+    cbTail.title = continuityBlocked ? "本段与上段分辨率不同，禁止续接尾帧" : "续接上段尾帧；选择后自动关闭 MotionContext，也可再次取消";
     cbTail.addEventListener("change", () => {
-      if (!cbTail.checked) { cbTail.checked = true; return; }
-      s.use_tail = true; s.motion_context = false; save(); renderEditor();
+      s.use_tail = cbTail.checked;
+      if (cbTail.checked) s.motion_context = false;
+      save(); renderEditor();
     });
     row0.appendChild(cbTail);
     const tailLab = mk("span", null, "续接上段尾帧");
-    if (sel === 0) tailLab.style.opacity = "0.5";
+    if (continuityBlocked) tailLab.style.opacity = "0.45";
     row0.appendChild(tailLab);
     const cbMotion = document.createElement("input");
     cbMotion.type = "checkbox";
     cbMotion.name = continuityName;
-    cbMotion.checked = sel > 0 && s.motion_context === true;
-    cbMotion.disabled = sel === 0;
-    cbMotion.title = sel === 0
-      ? "段1 没有上一段 clip，始终绕过 Motion Context"
-      : "加载上一段 Motion Context clip；取消后只绕过上下文加载，本段 clip 仍会保存";
+    cbMotion.checked = !continuityBlocked && s.motion_context === true;
+    cbMotion.disabled = false;
+    cbMotion.title = continuityBlocked ? "勾选后自动同步上段的宽高比、分辨率和帧率，再开启 MotionContext" : "选择后自动关闭尾帧续接；同时同步上段的宽高比、分辨率和帧率";
     cbMotion.addEventListener("change", () => {
-      if (!cbMotion.checked) { cbMotion.checked = true; return; }
-      s.motion_context = true; s.use_tail = false; save(); renderEditor();
+      s.motion_context = cbMotion.checked;
+      if (cbMotion.checked) {
+        const synced = syncSegmentToPrevious(segs, sel);
+        s.use_tail = false;
+        if (!Number.isFinite(Number(s.motion_context_index)) || Number(s.motion_context_index) < 0) {
+          s.motion_context_index = sel;
+        }
+        if (synced) status.textContent = `MotionContext 已开启：本段已同步为 ${synced[0]}×${synced[1]} / ${synced[2]}fps`;
+      }
+      save(); renderEditor();
     });
     row0.appendChild(cbMotion);
     const motionLab = mk("span", null, "MotionContext");
-    if (sel === 0) motionLab.style.opacity = "0.5";
     row0.appendChild(motionLab);
+    if (continuityBlocked) row0.appendChild(mk("span", "h3s-audio-warn", "尾帧续接已禁用；勾选 MotionContext 会自动同步上段尺寸和帧率"));
+    appendLocalMotionIndex(row0, s, sel);
     editor.appendChild(row0);
 
     /* ======== ② 本段提示词 ======== */
@@ -3238,6 +3436,7 @@ function buildStudio(node) {
       const out = source && !sharedOnly ? { ...source } : {
         seed: Math.floor(Math.random() * 1e15),
         refs: [],
+        ...defaultResolutionFields(),
         duration: 10,
         inherit_shared: true,
         use_tail: position > 0,
@@ -3249,6 +3448,9 @@ function buildStudio(node) {
         out.refs = Array.isArray(source.refs) ? source.refs.slice() : [];
         out.voice_refs = Array.isArray(source.voice_refs) ? source.voice_refs.slice() : [];
         out.voice_labels = source.voice_labels ? { ...source.voice_labels } : {};
+        for (const key of ["aspect_ratio", "megapixels", "multiple", "width", "height"]) {
+          if (source[key] != null) out[key] = source[key];
+        }
       }
       out.duration = parsedSeg.duration > 0 ? parsedSeg.duration : clampDur(10);
       out.inherit_shared = true;
@@ -3587,6 +3789,7 @@ function buildStudio(node) {
     row.appendChild(cb);
     row.appendChild(mk("span", null, "启用"));
 
+    appendResolutionControls(row, s);
     row.appendChild(mk("span", null, "时长"));
     durInput = mk("input", "h3s-durinput");
     durInput.type = "number";
@@ -3636,36 +3839,32 @@ function buildStudio(node) {
     // 「继承共享参考图」开关已从 UI 移除（v2 工作流无共享图接口，开关恒无效）。
     // 数据字段 s.inherit_shared 保留：若日后左侧接了 ref_image_*，共享图会自动带入，无需开关。
 
+    const continuityBlocked = segmentContinuityBlocked(segs, sel);
     const cbTail = document.createElement("input");
     const continuityName = `h3-cont-${node.id}-create-${sel}`;
     cbTail.type = "checkbox";
     cbTail.name = continuityName;
-    cbTail.checked = sel > 0 && s.use_tail === true;
-    cbTail.disabled = sel === 0 || generationMode !== "multi_ref";
-    cbTail.title = generationMode !== "multi_ref"
-      ? "首/尾帧模式只使用本段指定图片，不能混入上段尾帧"
-      : (sel === 0 ? "段1 没有上一段尾帧" : "以上一段视频的尾帧作为本段起点");
+    cbTail.checked = !continuityBlocked && s.use_tail === true;
+    cbTail.disabled = continuityBlocked;
+    cbTail.title = continuityBlocked ? "本段与上段分辨率不同，禁止续接尾帧" : "续接上段尾帧；选择后自动关闭 MotionContext，也可再次取消。首/尾帧模式中会作为本段的首帧。";
     cbTail.addEventListener("change", () => {
-      if (!cbTail.checked) { cbTail.checked = true; return; }
-      s.use_tail = true;
-      s.motion_context = false;
+      s.use_tail = cbTail.checked;
+      if (cbTail.checked) s.motion_context = false;
       s.prompt = ta.value;
       save();
       renderEditor();
     });
     row.appendChild(cbTail);
     const tailLab = mk("span", null, "续接上段尾帧");
-    if (sel === 0 || generationMode !== "multi_ref") tailLab.style.opacity = "0.5";
+    if (continuityBlocked) tailLab.style.opacity = "0.45";
     row.appendChild(tailLab);
 
     if (sel >= 1) {
       const btnCont = mk("button", "h3s-btn", "从视频续接");
-      btnCont.disabled = generationMode !== "multi_ref" || s.use_tail !== true;
-      btnCont.title = generationMode !== "multi_ref"
-        ? "首/尾帧模式只使用本段指定图片，不能导入上段续接帧"
-        : s.use_tail === true
+      btnCont.disabled = continuityBlocked || s.use_tail !== true;
+      btnCont.title = continuityBlocked ? "本段与上段分辨率不同，禁止导入续接帧" : s.use_tail === true
         ? "上传任意 mp4，抽最后一帧作为本段的续接起点"
-        : "当前选择 MotionContext；请先切换到“续接上段尾帧”再导入视频尾帧";
+        : "请先选择“续接上段尾帧”再导入视频尾帧";
       btnCont.addEventListener("click", () => {
         const inp = document.createElement("input");
         inp.type = "file";
@@ -3706,31 +3905,33 @@ function buildStudio(node) {
     const cbMotion = document.createElement("input");
     cbMotion.type = "checkbox";
     cbMotion.name = continuityName;
-    cbMotion.checked = sel > 0 && s.motion_context === true;
-    cbMotion.disabled = sel === 0 || generationMode !== "multi_ref";
-    cbMotion.title = generationMode !== "multi_ref"
-      ? "首/尾帧模式只使用本段指定图片，不能混入 Motion Context"
-      : sel === 0
-      ? "段1 没有上一段 clip，始终绕过 Motion Context"
-      : "加载上一段 Motion Context clip，连续画面与声音；取消后绕过加载，但本段仍保存 clip";
+    cbMotion.checked = !continuityBlocked && s.motion_context === true;
+    cbMotion.disabled = false;
+    cbMotion.title = continuityBlocked ? "勾选后自动同步上段的宽高比、分辨率和帧率，再开启 MotionContext" : "选择后自动关闭尾帧续接；同时同步上段的宽高比、分辨率和帧率";
     cbMotion.addEventListener("change", () => {
-      if (!cbMotion.checked) { cbMotion.checked = true; return; }
-      s.motion_context = true;
-      s.use_tail = false;
+      s.motion_context = cbMotion.checked;
+      if (cbMotion.checked) {
+        const synced = syncSegmentToPrevious(segs, sel);
+        s.use_tail = false;
+        if (!Number.isFinite(Number(s.motion_context_index)) || Number(s.motion_context_index) < 0) {
+          s.motion_context_index = sel;
+        }
+        if (synced) status.textContent = `MotionContext 已开启：本段已同步为 ${synced[0]}×${synced[1]} / ${synced[2]}fps`;
+      }
       s.prompt = ta.value;
       save();
       renderEditor();
     });
     row.appendChild(cbMotion);
     const motionLab = mk("span", null, "MotionContext");
-    if (sel === 0 || generationMode !== "multi_ref") motionLab.style.opacity = "0.5";
     row.appendChild(motionLab);
+    if (continuityBlocked) row.appendChild(mk("span", "h3s-audio-warn", "尾帧续接已禁用；勾选 MotionContext 会自动同步上段尺寸和帧率"));
 
     editor.appendChild(row);
 
     // Motion Context 的来源：默认保持原有“本地自动 latent”逻辑；云平台不能写 latent
     // 时可改为上传此前保存的 latent，或直接上传上一段带音轨的视频。
-    if (sel >= 1 && generationMode === "multi_ref" && s.motion_context === true) {
+    if (s.motion_context === true) {
       const sourceRow = mk("div", "h3s-row");
       sourceRow.appendChild(mk("span", "h3s-hint", "Motion Context 来源："));
       const sourceSel = document.createElement("select");
@@ -3751,6 +3952,28 @@ function buildStudio(node) {
         save(); renderEditor();
       });
       sourceRow.appendChild(sourceSel);
+
+      if (motionContextSource === "local_latent") {
+        const indexLabel = mk("span", "h3s-hint", "Clip_index");
+        const indexIn = mk("input", "h3s-durinput");
+        indexIn.type = "number";
+        indexIn.min = "0";
+        indexIn.max = "9998";
+        indexIn.step = "1";
+        const currentIndex = Number(s.motion_context_index);
+        indexIn.value = String(Number.isFinite(currentIndex) && currentIndex >= 0
+          ? Math.floor(currentIndex) : sel);
+        indexIn.title = "读取的本地 clip 编号。0=不加载旧 latent；本段会保存为 clip_(Index+1)。";
+        indexIn.addEventListener("change", () => {
+          const parsed = Math.floor(Number(indexIn.value));
+          s.motion_context_index = Number.isFinite(parsed)
+            ? Math.min(9998, Math.max(0, parsed)) : sel;
+          indexIn.value = String(s.motion_context_index);
+          save(); renderEditor();
+        });
+        sourceRow.append(indexLabel, indexIn, mk("span", "h3s-hint",
+          "0=不加载；生成后保存 clip " + (Number(indexIn.value) + 1)));
+      }
 
       if (motionContextSource === "upload_latent") {
         sourceRow.appendChild(mk("span", "h3s-hint", s.motion_context_latent
@@ -3820,10 +4043,6 @@ function buildStudio(node) {
     generationSelect.title = "多参生视频保留所有角色/参考图；其余模式要求主 model 输入连接 FL2VA 模型。首尾帧按下方图片从左到右第 1、2 张读取。";
     generationSelect.addEventListener("change", () => {
       s.generation_mode = generationSelect.value;
-      if (s.generation_mode !== "multi_ref") {
-        s.use_tail = false;
-        s.motion_context = false;
-      }
       save();
       renderEditor();
     });
@@ -4334,7 +4553,7 @@ function buildStudio(node) {
     refs.style.minHeight = "88px";
 
     const pics = [];
-    if (!endpointMode && s.use_tail !== false && sel > 0) {
+    if (s.use_tail === true && sel > 0) {
       pics.push({ src: api.apiURL("/h3director/tail?seg=" + sel + "&" + _modeQ() + "&t=" + Date.now()), tag: "尾帧" });
     }
     s.refs.forEach((name, k) => {
@@ -4774,7 +4993,7 @@ function buildStudio(node) {
 
     // 云端无磁盘 latent 时的 Motion Context 视频续接。放在本段音频正下方，
     // 让用户明确知道：上传视频的末尾画面与音轨会一并进入 context_frames/context_audio。
-    if (sel >= 1 && generationMode === "multi_ref" && s.motion_context === true
+    if (s.motion_context === true
       && motionContextSource === "video") {
       const uploadContextVideo = async (file) => {
         if (file.size > 200 * 1024 * 1024) throw new Error("视频不能大于 200 MB");
