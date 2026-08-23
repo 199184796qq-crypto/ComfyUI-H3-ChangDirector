@@ -176,8 +176,8 @@ const SLOT_H = 64;
 const DRAG_PX_PER_SEC = 12;
 const DUR_MIN = 1.6;
 const DUR_MAX = 15;
-// 段成片仍会生成、保存、导出；这里只关闭节点底部的内嵌播放器，避免它占用面板空间和加载视频。
-const SHOW_SAVED_SEGMENT_PREVIEW = false;
+// 点击时间轴段落时，在节点内显示对应成片；有文件则立即播放。
+const SHOW_SAVED_SEGMENT_PREVIEW = true;
 
 /* 与 ComfyUI 内置 Resolution Selector（comfy_extras/nodes_resolution.py）完全一致。 */
 const H3S_ASPECT_RATIOS = {
@@ -1377,7 +1377,7 @@ function buildStudio(node) {
     if (!Array.isArray(items)) return;
     items.forEach((seg, idx) => {
       if (seg.motion_context === true) {
-        if (!["local_latent", "upload_latent", "video"].includes(seg.motion_context_source)) {
+        if (!["local_latent", "upload_latent", "aliyun_oss", "video"].includes(seg.motion_context_source)) {
           seg.motion_context_source = "local_latent";
         }
         if (seg.motion_context_source === "local_latent") {
@@ -1395,7 +1395,7 @@ function buildStudio(node) {
   };
   const appendLocalMotionIndex = (row, seg, segmentIndex) => {
     if (seg.motion_context !== true) return;
-    if (!["local_latent", "upload_latent", "video"].includes(seg.motion_context_source)) {
+    if (!["local_latent", "upload_latent", "aliyun_oss", "video"].includes(seg.motion_context_source)) {
       seg.motion_context_source = "local_latent";
     }
     if (seg.motion_context_source !== "local_latent") return;
@@ -1582,6 +1582,9 @@ function buildStudio(node) {
   save();
 
   let sel = 0;
+  // 仅由时间轴段卡片点击设置。它让 video.play() 保持在用户点击的调用链中，
+  // 这样浏览器可以连同音频一起自动播放，而不是被自动播放策略拦截。
+  let autoPlaySegment = null;
   /* v2.13.15：鼠标框选选中的段集合（拖框高亮，配合「删选中」按钮批量删除） */
   const boxSel = new Set();
   const clearBoxSel = () => { boxSel.clear(); };
@@ -1838,8 +1841,24 @@ function buildStudio(node) {
     save();
   });
   syncLowVramButton();
+  const btnPreviewToggle = mk("button", "h3s-btn", "隐藏播放器");
+  const syncPreviewToggle = () => {
+    const hidden = node.properties.h3_segment_preview_hidden === true;
+    btnPreviewToggle.textContent = hidden ? "显示播放器" : "隐藏播放器";
+    btnPreviewToggle.classList.toggle("primary", !hidden);
+    btnPreviewToggle.title = hidden
+      ? "显示当前段已生成的视频播放器"
+      : "隐藏当前段视频播放器（不删除任何视频文件）";
+  };
+  btnPreviewToggle.addEventListener("click", () => {
+    node.properties.h3_segment_preview_hidden = node.properties.h3_segment_preview_hidden !== true;
+    save();
+    syncPreviewToggle();
+    renderEditor();
+  });
+  syncPreviewToggle();
   bar.append(btnTabC, btnTabV, btnTabT, btnFullSegmentPrompt, btnAssignSegmentPrompt,
-    btnRun, btnLowVram, btnAdd, btnDel, btnSelAll, btnSelNone, btnTailAll, btnTailNone, totalLab, verLab, status);
+    btnRun, btnLowVram, btnPreviewToggle, btnAdd, btnDel, btnSelAll, btnSelNone, btnTailAll, btnTailNone, totalLab, verLab, status);
   syncTabs();
   syncPromptAssignmentControls();
   box.appendChild(bar);
@@ -2262,7 +2281,13 @@ function buildStudio(node) {
       });
       slot.appendChild(durLab);
       if (!s.enabled) slot.appendChild(mk("span", "off", "停用"));
-      slot.addEventListener("click", () => { clearBoxSel(); sel = i; renderTimeline(); renderEditor(); });
+      slot.addEventListener("click", () => {
+        clearBoxSel();
+        sel = i;
+        autoPlaySegment = node.properties.h3_segment_preview_hidden === true ? null : i;
+        renderTimeline();
+        renderEditor();
+      });
 
       /* 右缘拖拽柄：拖动调整本段时长 */
       const rz = mk("div", "rz");
@@ -3081,22 +3106,32 @@ function buildStudio(node) {
     vta.style.cssText += "flex:none;width:100%;height:84px;";
     editor.appendChild(vta);
 
-    if (!SHOW_SAVED_SEGMENT_PREVIEW) { autoFitCompactPanel(); return; }
+    if (!SHOW_SAVED_SEGMENT_PREVIEW || node.properties.h3_segment_preview_hidden === true) { autoFitCompactPanel(); return; }
     /* ======== ⑥ 成片预览（v2.8，与创作界面同款：可拖大 + 放大查看）======== */
     const pvWrap = mk("div", "h3s-pv");
     pvWrap.style.cssText = "flex:1;display:flex;flex-direction:column;min-height:240px;gap:4px;";
     editor.appendChild(pvWrap);
     (async () => {
+      const selectedSegment = sel;
+      const shouldAutoPlay = autoPlaySegment === selectedSegment;
+      if (shouldAutoPlay) autoPlaySegment = null;
       let src = null;
-      try {
-        const st = await (await api.fetchApi("/h3director/status?" + _modeQ())).json();
-        const info = st.segments && st.segments[String(sel + 1)];
-        if (info && info.video) {
-          src = api.apiURL("/h3director/video?seg=" + (sel + 1) + "&" + _modeQ() + "&t=" + (info.mtime || Date.now()));
-        }
-      } catch (e) { /* 路由不可用时静默降级 */ }
+      if (shouldAutoPlay) {
+        // 不先 await 状态接口，确保 play() 仍在点击段卡片的用户手势中执行。
+        src = api.apiURL("/h3director/video?seg=" + (selectedSegment + 1) + "&" + _modeQ() + "&t=" + Date.now());
+      } else {
+        try {
+          const st = await (await api.fetchApi("/h3director/status?" + _modeQ())).json();
+          const info = st.segments && st.segments[String(selectedSegment + 1)];
+          if (info && info.video) {
+            src = api.apiURL("/h3director/video?seg=" + (selectedSegment + 1) + "&" + _modeQ() + "&t=" + (info.mtime || Date.now()));
+          }
+        } catch (e) { /* 路由不可用时静默降级 */ }
+      }
       if (!src) {
-        pvWrap.appendChild(mk("div", "h3s-hint", "段" + (sel + 1) + " 尚未生成视频，运行后可在此预览。"));
+        pvWrap.style.flex = "none";
+        pvWrap.style.minHeight = "0";
+        pvWrap.appendChild(mk("div", "h3s-hint", "段" + (selectedSegment + 1) + " 尚未生成视频，运行后可在此预览。"));
         return;
       }
       const headRow = mk("div", "h3s-row");
@@ -3114,9 +3149,18 @@ function buildStudio(node) {
       v.src = src;
       v.controls = true;
       v.preload = "metadata";
+      v.addEventListener("error", () => {
+        pvWrap.style.flex = "none";
+        pvWrap.style.minHeight = "0";
+        pvWrap.replaceChildren(mk("div", "h3s-hint", "段" + (selectedSegment + 1) + " 尚未生成视频。"));
+      }, { once: true });
       pvBox.appendChild(v);
       pvWrap.appendChild(pvBox);
       attachBottomBar(pvBox, 240, 135);
+      if (shouldAutoPlay) {
+        v.autoplay = true;
+        v.play().catch(() => { /* 浏览器限制时保留原生播放按钮 */ });
+      }
     })();
   }
 
@@ -3753,22 +3797,31 @@ function buildStudio(node) {
       if (textAiPanel !== openedPanel) return;
     });
 
-    if (!SHOW_SAVED_SEGMENT_PREVIEW) { autoFitCompactPanel(); return; }
+    if (!SHOW_SAVED_SEGMENT_PREVIEW || node.properties.h3_segment_preview_hidden === true) { autoFitCompactPanel(); return; }
     /* ======== ③ 本段成片预览（与其他界面同款）======== */
     const pvWrap = mk("div", "h3s-pv");
     pvWrap.style.cssText = "flex:1;display:flex;flex-direction:column;min-height:240px;gap:4px;";
     editor.appendChild(pvWrap);
     (async () => {
+      const selectedSegment = sel;
+      const shouldAutoPlay = autoPlaySegment === selectedSegment;
+      if (shouldAutoPlay) autoPlaySegment = null;
       let src = null;
-      try {
-        const st = await (await api.fetchApi("/h3director/status?" + _modeQ())).json();
-        const info = st.segments && st.segments[String(sel + 1)];
-        if (info && info.video) {
-          src = api.apiURL("/h3director/video?seg=" + (sel + 1) + "&" + _modeQ() + "&t=" + (info.mtime || Date.now()));
-        }
-      } catch (e) { /* 路由不可用时静默降级 */ }
+      if (shouldAutoPlay) {
+        src = api.apiURL("/h3director/video?seg=" + (selectedSegment + 1) + "&" + _modeQ() + "&t=" + Date.now());
+      } else {
+        try {
+          const st = await (await api.fetchApi("/h3director/status?" + _modeQ())).json();
+          const info = st.segments && st.segments[String(selectedSegment + 1)];
+          if (info && info.video) {
+            src = api.apiURL("/h3director/video?seg=" + (selectedSegment + 1) + "&" + _modeQ() + "&t=" + (info.mtime || Date.now()));
+          }
+        } catch (e) { /* 路由不可用时静默降级 */ }
+      }
       if (!src) {
-        pvWrap.appendChild(mk("div", "h3s-hint", "段" + (sel + 1) + " 尚未生成视频，运行后可在此预览。"));
+        pvWrap.style.flex = "none";
+        pvWrap.style.minHeight = "0";
+        pvWrap.appendChild(mk("div", "h3s-hint", "段" + (selectedSegment + 1) + " 尚未生成视频，运行后可在此预览。"));
         return;
       }
       const headRow = mk("div", "h3s-row");
@@ -3786,9 +3839,18 @@ function buildStudio(node) {
       v.src = src;
       v.controls = true;
       v.preload = "metadata";
+      v.addEventListener("error", () => {
+        pvWrap.style.flex = "none";
+        pvWrap.style.minHeight = "0";
+        pvWrap.replaceChildren(mk("div", "h3s-hint", "段" + (selectedSegment + 1) + " 尚未生成视频。"));
+      }, { once: true });
       pvBox.appendChild(v);
       pvWrap.appendChild(pvBox);
       attachBottomBar(pvBox, 240, 135);
+      if (shouldAutoPlay) {
+        v.autoplay = true;
+        v.play().catch(() => { /* 浏览器限制时保留原生播放按钮 */ });
+      }
     })();
   }
 
@@ -3803,7 +3865,7 @@ function buildStudio(node) {
     if (!s) return;
     const generationMode = s.generation_mode || "multi_ref";
     if (!s.generation_mode) s.generation_mode = generationMode;
-    const motionContextSource = ["local_latent", "upload_latent", "video"].includes(s.motion_context_source)
+    const motionContextSource = ["local_latent", "upload_latent", "aliyun_oss", "video"].includes(s.motion_context_source)
       ? s.motion_context_source : "local_latent";
     if (!s.motion_context_source) s.motion_context_source = motionContextSource;
     const externalTextInput = (node.inputs || []).find((input) => input.name === "外部文本");
@@ -5795,24 +5857,33 @@ function buildStudio(node) {
       editor.appendChild(offRow);
     }
 
-    if (!SHOW_SAVED_SEGMENT_PREVIEW) { autoFitCompactPanel(); return; }
+    if (!SHOW_SAVED_SEGMENT_PREVIEW || node.properties.h3_segment_preview_hidden === true) { autoFitCompactPanel(); return; }
     // ---- 本段成片预览：点击段落即可查看已生成视频（带声音），方便定位想重跑的段 ----
     const pvWrap = mk("div", "h3s-pv");
     /* pvWrap 作为编辑区的弹性填充层：display:flex 后 pvBox 的 flex:1 才生效 */
     pvWrap.style.cssText = "flex:1;display:flex;flex-direction:column;min-height:260px;gap:4px;";
     editor.appendChild(pvWrap);
     (async () => {
+      const selectedSegment = sel;
+      const shouldAutoPlay = autoPlaySegment === selectedSegment;
+      if (shouldAutoPlay) autoPlaySegment = null;
       let src = null;
-      try {
-        const st = await (await api.fetchApi("/h3director/status?" + _modeQ())).json();
-        const info = st.segments && st.segments[String(sel + 1)];
-        if (info && info.video) {
-          // 走插件自 serve 路由（内置 /view 对中文文件名 404 实测）；mtime 缓存指纹防旧片
-          src = api.apiURL("/h3director/video?seg=" + (sel + 1) + "&" + _modeQ() + "&t=" + (info.mtime || Date.now()));
-        }
-      } catch (e) { /* 路由不可用时静默降级为提示 */ }
+      if (shouldAutoPlay) {
+        src = api.apiURL("/h3director/video?seg=" + (selectedSegment + 1) + "&" + _modeQ() + "&t=" + Date.now());
+      } else {
+        try {
+          const st = await (await api.fetchApi("/h3director/status?" + _modeQ())).json();
+          const info = st.segments && st.segments[String(selectedSegment + 1)];
+          if (info && info.video) {
+            // 走插件自 serve 路由（内置 /view 对中文文件名 404 实测）；mtime 缓存指纹防旧片
+            src = api.apiURL("/h3director/video?seg=" + (selectedSegment + 1) + "&" + _modeQ() + "&t=" + (info.mtime || Date.now()));
+          }
+        } catch (e) { /* 路由不可用时静默降级为提示 */ }
+      }
       if (!src) {
-        pvWrap.appendChild(mk("div", "h3s-hint", "段" + (sel + 1) + " 尚未生成视频，运行后可在此预览。"));
+        pvWrap.style.flex = "none";
+        pvWrap.style.minHeight = "0";
+        pvWrap.appendChild(mk("div", "h3s-hint", "段" + (selectedSegment + 1) + " 尚未生成视频，运行后可在此预览。"));
         return;
       }
       const headRow = mk("div", "h3s-row");
@@ -5833,9 +5904,18 @@ function buildStudio(node) {
       v.src = src;
       v.controls = true;
       v.preload = "metadata";
+      v.addEventListener("error", () => {
+        pvWrap.style.flex = "none";
+        pvWrap.style.minHeight = "0";
+        pvWrap.replaceChildren(mk("div", "h3s-hint", "段" + (selectedSegment + 1) + " 尚未生成视频。"));
+      }, { once: true });
       pvBox.appendChild(v);
       pvWrap.appendChild(pvBox);
       attachBottomBar(pvBox, 240, 135);
+      if (shouldAutoPlay) {
+        v.autoplay = true;
+        v.play().catch(() => { /* 浏览器限制时保留原生播放按钮 */ });
+      }
     })();
   }
 
