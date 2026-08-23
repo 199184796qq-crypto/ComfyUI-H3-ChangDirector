@@ -4,7 +4,7 @@ import { H3_TEXT_TEMPLATES } from "./h3_templates.js";
 
 /* 前端版本号：与 routes.py 的 BACKEND_VERSION 对应。
    status 接口返回的后端版本若与此不一致（用户改了代码但没重启/没强刷），状态栏红字提示。 */
-const H3S_VERSION = "2.25.3";
+const H3S_VERSION = "2.25.4";
 const activeProjectIds = new Map();
 
 function newProjectId() {
@@ -1854,6 +1854,10 @@ function buildStudio(node) {
     node.properties.h3_segment_preview_hidden = node.properties.h3_segment_preview_hidden !== true;
     save();
     syncPreviewToggle();
+    applyPreviewLayout();
+    if (!previewIsHidden()) {
+      node.setSize([Math.max(760, node.size[0]), Math.max(620, node.size[1])]);
+    }
     renderEditor();
   });
   syncPreviewToggle();
@@ -1950,10 +1954,27 @@ function buildStudio(node) {
   const editor = mk("div", "h3s-editor");
   box.appendChild(editor);
 
+  const previewIsHidden = () => !SHOW_SAVED_SEGMENT_PREVIEW || node.properties.h3_segment_preview_hidden === true;
+  const applyPreviewLayout = () => {
+    if (previewIsHidden()) {
+      box.style.height = "auto";
+      box.style.minHeight = "0";
+      editor.style.flex = "none";
+      editor.style.minHeight = "0";
+      editor.style.overflow = "visible";
+    } else {
+      box.style.height = "";
+      box.style.minHeight = "";
+      editor.style.flex = "";
+      editor.style.minHeight = "";
+      editor.style.overflow = "";
+    }
+  };
   // 已关闭成片预览时，编辑区不再需要占满播放器原有的空间。改成内容高度，
   // 每次重绘后同步收缩/扩展整个节点，避免“播放器没了但黑色空白还在”。
   const autoFitCompactPanel = () => {
-    if (SHOW_SAVED_SEGMENT_PREVIEW) return;
+    if (!previewIsHidden()) return;
+    applyPreviewLayout();
     // 添加或删除锚点卡片后，须等待布局完成再取高度；否则会量到上一帧的旧高度。
     requestAnimationFrame(() => requestAnimationFrame(() => {
       // box 已在紧凑模式下设为 height:auto；scrollHeight 才是所有真实内容
@@ -1967,12 +1988,14 @@ function buildStudio(node) {
       }
     }));
   };
-  if (!SHOW_SAVED_SEGMENT_PREVIEW) {
-    box.style.height = "auto";
-    box.style.minHeight = "0";
-    editor.style.flex = "none";
-    editor.style.minHeight = "0";
-    editor.style.overflow = "visible";
+  applyPreviewLayout();
+
+  function hideSegmentPreview() {
+    node.properties.h3_segment_preview_hidden = true;
+    save();
+    syncPreviewToggle();
+    applyPreviewLayout();
+    renderEditor();
   }
 
   async function queueThis() {
@@ -3140,6 +3163,10 @@ function buildStudio(node) {
       zoom.title = "新窗口打开，原生分辨率播放";
       zoom.addEventListener("click", () => window.open(src, "_blank"));
       headRow.appendChild(zoom);
+      const hidePreview = mk("button", "h3s-btn", "隐藏播放器");
+      hidePreview.title = "隐藏播放器并收起预览区域";
+      hidePreview.addEventListener("click", hideSegmentPreview);
+      headRow.appendChild(hidePreview);
       headRow.appendChild(mk("span", "h3s-hint", "拖预览框右下角可自由缩放"));
       pvWrap.appendChild(headRow);
       const pvBox = mk("div", "h3s-pvbox");
@@ -3830,6 +3857,10 @@ function buildStudio(node) {
       zoom.title = "新窗口打开，原生分辨率播放";
       zoom.addEventListener("click", () => window.open(src, "_blank"));
       headRow.appendChild(zoom);
+      const hidePreview = mk("button", "h3s-btn", "隐藏播放器");
+      hidePreview.title = "隐藏播放器并收起预览区域";
+      hidePreview.addEventListener("click", hideSegmentPreview);
+      headRow.appendChild(hidePreview);
       headRow.appendChild(mk("span", "h3s-hint", "拖预览框右下角可自由缩放"));
       pvWrap.appendChild(headRow);
       const pvBox = mk("div", "h3s-pvbox");
@@ -4030,11 +4061,11 @@ function buildStudio(node) {
 
     /* 创作界面脚本导入：复用文本界面的 Base / Ref2VA / 普通文本解析器。
        参考图按角色名重新分配；同序配音和音色保留。 */
-    // 创作界面的剧本导入区可独立折叠；默认展开，状态随工作流保存。
+    // 创作界面的剧本导入区可独立折叠；默认收起，状态随工作流保存。
     const createScriptWrap = document.createElement("details");
     createScriptWrap.className = "h3s-slrow";
     createScriptWrap.style.cssText = "display:block;margin-top:5px;min-width:260px;overflow:visible;";
-    createScriptWrap.open = node.properties.h3_create_script_open !== false;
+    createScriptWrap.open = node.properties.h3_create_script_open === true;
         createScriptWrap.addEventListener("toggle", () => {
             node.properties.h3_create_script_open = createScriptWrap.open;
             save();
@@ -5897,6 +5928,10 @@ function buildStudio(node) {
       zoom.title = "新窗口打开，原生分辨率播放";
       zoom.addEventListener("click", () => window.open(src, "_blank"));
       headRow.appendChild(zoom);
+      const hidePreview = mk("button", "h3s-btn", "隐藏播放器");
+      hidePreview.title = "隐藏播放器并收起预览区域";
+      hidePreview.addEventListener("click", hideSegmentPreview);
+      headRow.appendChild(hidePreview);
       headRow.appendChild(mk("span", "h3s-hint", "拖预览框右下角可自由缩放"));
       pvWrap.appendChild(headRow);
       /* 可缩放预览框：resize:both 拖右下角；object-fit:contain 保证画面完整不变形 */
