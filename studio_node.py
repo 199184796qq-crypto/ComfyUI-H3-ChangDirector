@@ -25,7 +25,11 @@ import comfy.utils
 import comfy.model_management
 import latent_preview
 from comfy_extras.nodes_custom_sampler import Noise_RandomNoise, Guider_Basic
-from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo, MiniMaxH3ImageToVideo
+from comfy_extras.nodes_minimax_h3 import (
+    MiniMaxH3ReferenceToVideo,
+    MiniMaxH3ImageToVideo,
+    MiniMaxH3AddGuide,
+)
 from comfy_extras.nodes_audio import vae_decode_audio
 
 CATEGORY = "H3 长序列分镜融合台"
@@ -34,7 +38,7 @@ INPUT_DIR = folder_paths.get_input_directory()
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 PROJECT_ROOT = os.path.join(VIDEO_DIR, "h3director")
 FPS = 24
-CACHE_SCHEMA = 11  # v2.25.2：MotionContext 自动同步上段尺寸、比例和帧率
+CACHE_SCHEMA = 12  # v2.26.0：段级 Add Guide 时间锚点
 
 # 段级生成模式。multi_ref 保持旧版 Ref2VA 多参考图行为；其余模式走
 # MiniMaxH3ImageToVideo，并由本段 refs 的顺序提供首帧/尾帧。
@@ -586,6 +590,102 @@ def _load_input_image(name):
     img = Image.open(_resolve_input(name)).convert("RGB")
     arr = np.asarray(img).astype(np.float32) / 255.0
     return torch.from_numpy(arr)[None,]
+
+
+def _segment_guides(seg_cfg):
+    """Read the director UI's per-segment Guide track defensively.
+
+    A guide is deliberately data-only so old workflows stay valid.  Each
+    record may carry an image, audio, or both; incomplete cards are ignored
+    until the user finishes selecting their source files.
+    """
+    raw = (seg_cfg or {}).get("guides") or []
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for order, guide in enumerate(raw):
+        if not isinstance(guide, dict):
+            continue
+        image = str(guide.get("image") or "").strip()
+        audio = str(guide.get("audio") or "").strip()
+        if not image and not audio:
+            continue
+        try:
+            at_seconds = float(guide.get("at_seconds", 0.0))
+        except (TypeError, ValueError):
+            at_seconds = 0.0
+        out.append({
+            "order": order,
+            "image": image or None,
+            "audio": audio or None,
+            "at_seconds": max(0.0, at_seconds),
+        })
+    return out
+
+
+def _guide_signature(seg_cfg):
+    """Cache fingerprint for both Guide timing and the selected input files."""
+    signature = []
+    for guide in _segment_guides(seg_cfg):
+        signature.append({
+            "at_seconds": guide["at_seconds"],
+            "image": _input_signature(guide["image"]),
+            "audio": _input_signature(guide["audio"]),
+        })
+    return signature
+
+
+def _apply_segment_guides(conditioning, latent, vae, audio_vae, seg_cfg,
+                          trim_frames, total_frames, seg_idx, ffmpeg):
+    """Chain this segment's Add Guide cards after Motion Context.
+
+    Guide times are expressed in the *delivered* clip timeline.  Motion
+    Context pins and later trims its head, therefore the anchor needs the
+    matching trim offset while it is still operating on the sampler latent.
+    This also keeps a 0-second guide out of Motion Context's protected head.
+    """
+    guides = _segment_guides(seg_cfg)
+    if not guides:
+        return conditioning
+
+    visible_frames = max(1, int(total_frames) - max(0, int(trim_frames)))
+    for guide in sorted(guides, key=lambda item: (item["at_seconds"], item["order"])):
+        requested = int(round(guide["at_seconds"] * FPS))
+        requested = max(0, min(visible_frames - 1, requested))
+        frame_idx = requested + max(0, int(trim_frames))
+        image = None
+        audio = None
+        if guide["image"]:
+            try:
+                image = _load_input_image(guide["image"])
+            except Exception as exc:
+                raise ValueError("[H3导演台] 段%d的图片锚点加载失败 %s: %s" % (
+                    seg_idx, guide["image"], exc)) from exc
+        if guide["audio"]:
+            audio_path = _resolve_input(guide["audio"])
+            if not os.path.isfile(audio_path):
+                raise ValueError("[H3导演台] 段%d的音频锚点不存在: %s" % (
+                    seg_idx, guide["audio"]))
+            try:
+                # Guide audio is an exact timeline anchor; do not inherit the
+                # segment's dialogue trimming/offset settings.
+                audio = _load_audio_for_ref(audio_path, {}, ffmpeg)
+            except Exception as exc:
+                raise ValueError("[H3导演台] 段%d的音频锚点加载失败 %s: %s" % (
+                    seg_idx, guide["audio"], exc)) from exc
+        result = MiniMaxH3AddGuide.execute(
+            conditioning, latent, frame_idx,
+            vae=vae if image is not None else None,
+            audio_vae=audio_vae if audio is not None else None,
+            image=image,
+            audio=audio,
+        )
+        conditioning = result.result[0]
+        _log("[H3导演台] 段%d Add Guide：第 %.2f 秒 -> 采样帧 %d%s%s" % (
+            seg_idx, guide["at_seconds"], frame_idx,
+            "（图片）" if image is not None else "",
+            "（音频）" if audio is not None else ""))
+    return conditioning
 
 
 def _config_hash(cfg):
@@ -1309,6 +1409,14 @@ class H3DirectorStudio:
         else:
             _log("[H3导演台] 段%d MotionContext 已关闭：不加载上一段 clip" % seg_idx)
 
+        # 段级 Guide 在 Motion Context 之后追加。这样多个 Guide 的 positive
+        # 会像画布上连续串联的 Add Guide 一样逐个累积，并且其秒数以最终导出
+        # （已去掉上下文前缀）的片段为准。
+        cond = _apply_segment_guides(
+            cond, latent, vae, audio_vae, seg_cfg,
+            trim_frames=trim_frames, total_frames=length,
+            seg_idx=seg_idx, ffmpeg=ffmpeg)
+
         if external_sigmas is None:
             sigmas = comfy.samplers.calculate_sigmas(
                 sample_model.get_model_object("model_sampling"), scheduler, steps).cpu()[-(steps + 1):]
@@ -1639,6 +1747,7 @@ class H3DirectorStudio:
                 "prompt": (global_prompt or "") + "\n\n" + seg_cfg.get("prompt", ""), "seed": seg_cfg.get("seed", 0),
                 "generation_mode": _generation_mode(seg_cfg),
                 "refs": [_input_signature(n) for n in (seg_cfg.get("refs") or [])],
+                "guides": _guide_signature(seg_cfg),
                 "shared_refs": [_input_signature(n) for n in shared_ref_names],
                 "duration": seg_cfg.get("duration", 时长秒),
                 "inherit_shared": seg_cfg.get("inherit_shared", True),

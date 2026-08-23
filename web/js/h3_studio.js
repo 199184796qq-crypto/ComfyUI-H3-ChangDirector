@@ -176,6 +176,8 @@ const SLOT_H = 64;
 const DRAG_PX_PER_SEC = 12;
 const DUR_MIN = 1.6;
 const DUR_MAX = 15;
+// 段成片仍会生成、保存、导出；这里只关闭节点底部的内嵌播放器，避免它占用面板空间和加载视频。
+const SHOW_SAVED_SEGMENT_PREVIEW = false;
 
 /* 与 ComfyUI 内置 Resolution Selector（comfy_extras/nodes_resolution.py）完全一致。 */
 const H3S_ASPECT_RATIOS = {
@@ -1870,6 +1872,31 @@ function buildStudio(node) {
   const editor = mk("div", "h3s-editor");
   box.appendChild(editor);
 
+  // 已关闭成片预览时，编辑区不再需要占满播放器原有的空间。改成内容高度，
+  // 每次重绘后同步收缩/扩展整个节点，避免“播放器没了但黑色空白还在”。
+  const autoFitCompactPanel = () => {
+    if (SHOW_SAVED_SEGMENT_PREVIEW) return;
+    // 添加或删除锚点卡片后，须等待布局完成再取高度；否则会量到上一帧的旧高度。
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      // box 已在紧凑模式下设为 height:auto；scrollHeight 才是所有真实内容
+      // （含帧锚点卡片）的高度。不能用元素当前可视高度，否则会把旧节点的
+      // 空白高度又带回新的计算结果。
+      const contentHeight = Math.ceil(box.scrollHeight);
+      // 与 DOMWidget 的 TOP_RESERVED 保持一致：标题、接口和常规 widget 区约 210px。
+      const wantedHeight = Math.max(320, contentHeight + 218);
+      if (Math.abs((node.size && node.size[1] || 0) - wantedHeight) > 2) {
+        node.setSize([Math.max(node.size[0], 760), wantedHeight]);
+      }
+    }));
+  };
+  if (!SHOW_SAVED_SEGMENT_PREVIEW) {
+    box.style.height = "auto";
+    box.style.minHeight = "0";
+    editor.style.flex = "none";
+    editor.style.minHeight = "0";
+    editor.style.overflow = "visible";
+  }
+
   async function queueThis() {
     const { output } = await app.graphToPrompt();
     const keep = new Set();
@@ -2314,6 +2341,253 @@ function buildStudio(node) {
     return parts.join(", ") + "。提示词写 @图N 会自动转成 <Picture N>，点下面缩略图可直接插入引用。";
   }
 
+  /* 段级 Add Guide 轨道。它不改变参考图/配音的既有语义：参考素材仍作用于
+     整段，Guide 则在指定时间把图片、音频或两者锚到 H3 的采样时间线上。 */
+  function ensureSegmentGuides(s) {
+    if (!Array.isArray(s.guides)) s.guides = [];
+    s.guides = s.guides.filter((g) => g && typeof g === "object").map((g) => ({
+      kind: ["image", "audio", "image_audio"].includes(g.kind) ? g.kind
+        : (g.image && g.audio ? "image_audio" : g.audio ? "audio" : "image"),
+      image: g.image || "",
+      image_label: g.image_label || "",
+      audio: g.audio || "",
+      audio_label: g.audio_label || "",
+      at_seconds: Math.max(0, Number(g.at_seconds) || 0),
+    }));
+    return s.guides;
+  }
+
+  function appendGuideTrack(s, scopeLabel = "") {
+    const guides = ensureSegmentGuides(s);
+    const wrap = document.createElement("details");
+    wrap.className = "h3s-slrow";
+    wrap.style.cssText = "display:block;margin-top:5px;min-width:260px;min-height:64px;overflow:visible;";
+    const savedGuideSize = s.guide_area_size;
+    if (savedGuideSize && Number.isFinite(Number(savedGuideSize.width))) {
+      wrap.style.flex = "none";
+      wrap.style.width = Math.max(260, Math.round(Number(savedGuideSize.width))) + "px";
+    }
+    // 仅恢复新版把手主动保存的高度。旧工作流里的历史高度没有 manual_height
+    // 标记，仍按内容自动撑开，避免把“添加锚点”按钮或卡片裁掉。
+    const hasManualGuideHeight = !!(savedGuideSize && savedGuideSize.manual_height === true
+      && Number.isFinite(Number(savedGuideSize.height)));
+    if (hasManualGuideHeight) {
+      wrap.style.height = Math.max(64, Math.round(Number(savedGuideSize.height))) + "px";
+      wrap.style.overflow = "auto";
+    }
+    // 新建段默认展开；用户折叠后的状态也随该段保存，避免编辑素材后重新渲染又弹开。
+    wrap.open = s.guide_area_open !== false;
+    wrap.addEventListener("toggle", () => { s.guide_area_open = wrap.open; save(); });
+    const summary = document.createElement("summary");
+    summary.style.cssText = "cursor:pointer;color:#9fd0ff;user-select:none;";
+    summary.textContent = "帧锚点 Add Guide（" + guides.length + " 个）";
+    wrap.appendChild(summary);
+    const body = mk("div", null);
+    body.style.cssText = "display:flex;flex-direction:column;gap:6px;padding:8px 0 2px;";
+    body.appendChild(mk("div", "h3s-hint",
+      "图片、音频或两者均可在指定秒数锚定；多个锚点会按时间自动排序并连续串联。"
+      + (s.motion_context === true
+        ? " 已开启 MotionContext：时间以导出片段为准，系统自动避开被裁掉的接力前缀。"
+        : "")));
+
+    // 用户拖出的宽度继续保留；一旦卡片数量或卡片内容变化，高度交还给
+    // 浏览器按内容计算，因此添加会撑开、删除会收回。
+    const resetGuideAutoHeight = () => {
+      const old = s.guide_area_size || {};
+      s.guide_area_size = Number.isFinite(Number(old.width))
+        ? { width: Math.round(Number(old.width)), height: null, manual_height: false }
+        : null;
+    };
+
+    // 帧锚点把手不仅调容器：已上传的图片缩略图也按可用高度同步缩放。
+    // 多个图片锚点会均分空间，避免放大后把后面的卡片挤出区域。
+    const guideImagePreviews = [];
+    const resizeGuideImages = (areaHeight) => {
+      if (!guideImagePreviews.length) return;
+      const fixedHeight = 100 + guides.length * 36;
+      const imageHeight = Math.max(30, Math.min(240,
+        Math.floor((Number(areaHeight) - fixedHeight) / guideImagePreviews.length)));
+      const imageWidth = Math.max(44, Math.round(imageHeight * 4 / 3));
+      guideImagePreviews.forEach((preview) => {
+        preview.style.width = imageWidth + "px";
+        preview.style.height = imageHeight + "px";
+      });
+    };
+
+    const addGuide = (kind) => {
+      guides.push({ kind, image: "", image_label: "", audio: "", audio_label: "", at_seconds: 0 });
+      resetGuideAutoHeight();
+      save(); renderEditor();
+    };
+    const addRow = mk("div", "h3s-row");
+    [["image", "+ 图片锚点"], ["audio", "+ 音频锚点"], ["image_audio", "+ 音画锚点"]]
+      .forEach(([kind, label]) => {
+        const btn = mk("button", "h3s-btn", label);
+        btn.title = kind === "image" ? "在目标时间固定一张图片"
+          : kind === "audio" ? "在目标时间固定一段音频"
+          : "在同一时间固定图片和音频";
+        btn.addEventListener("click", () => addGuide(kind));
+        addRow.appendChild(btn);
+      });
+    body.appendChild(addRow);
+
+    const pickImage = (guide) => {
+      const inp = document.createElement("input");
+      inp.type = "file"; inp.accept = "image/*"; inp.style.display = "none";
+      document.body.appendChild(inp);
+      inp.addEventListener("change", async () => {
+        try {
+          const file = inp.files && inp.files[0];
+          if (!file) return;
+          status.textContent = "正在上传锚点图片…";
+          const fd = new FormData();
+          fd.append("image", file, file.name); fd.append("overwrite", "true");
+          const r = await (await api.fetchApi("/upload/image", { method: "POST", body: fd })).json();
+          if (!r || !r.name) throw new Error((r && r.error) || "上传接口没有返回文件名");
+          guide.image = (r.subfolder ? r.subfolder + "/" : "") + r.name;
+          guide.image_label = file.name;
+          resetGuideAutoHeight();
+          save(); renderEditor();
+          status.textContent = "锚点图片已添加";
+        } catch (e) { status.textContent = "锚点图片上传失败: " + e.message; }
+        finally { inp.remove(); }
+      });
+      inp.click();
+    };
+    const pickAudio = (guide) => {
+      const inp = document.createElement("input");
+      inp.type = "file"; inp.accept = "audio/*,.wav,.mp3,.m4a,.ogg,.flac,.aac"; inp.style.display = "none";
+      document.body.appendChild(inp);
+      inp.addEventListener("change", async () => {
+        try {
+          const file = inp.files && inp.files[0];
+          if (!file) return;
+          status.textContent = "正在上传锚点音频…";
+          const fd = new FormData(); fd.append("audio", file, file.name);
+          const r = await (await api.fetchApi("/h3director/upload_audio", { method: "POST", body: fd })).json();
+          if (!(r && r.ok && r.name)) throw new Error((r && r.error) || "上传接口没有返回文件名");
+          guide.audio = r.name; guide.audio_label = r.label || file.name;
+          resetGuideAutoHeight();
+          save(); renderEditor();
+          status.textContent = "锚点音频已添加";
+        } catch (e) { status.textContent = "锚点音频上传失败: " + e.message; }
+        finally { inp.remove(); }
+      });
+      inp.click();
+    };
+
+    guides.forEach((guide, index) => {
+      const card = mk("div", null);
+      card.style.cssText = "border:1px solid #2f567a;border-radius:7px;padding:6px;background:#141b23;";
+      const head = mk("div", "h3s-row");
+      const kinds = { image: "图片", audio: "音频", image_audio: "音画" };
+      head.appendChild(mk("span", "num", "G" + (index + 1)));
+      head.appendChild(mk("span", "h3s-hint", kinds[guide.kind] + "锚点"));
+      const seconds = document.createElement("input");
+      seconds.type = "number"; seconds.min = "0"; seconds.max = String(Math.max(0, segDur(s) - 1 / PX_PER_SEC)); seconds.step = "0.05";
+      seconds.value = Number(guide.at_seconds || 0).toFixed(2); seconds.style.width = "58px";
+      seconds.title = "导出片段内的锚定时间（秒）；H3 按 24 fps 自动换算";
+      const frameHint = mk("span", "h3s-hint", "秒 · 帧 " + Math.round((guide.at_seconds || 0) * PX_PER_SEC));
+      const syncGuideTime = (saveValue) => {
+        const max = Math.max(0, segDur(s) - 1 / PX_PER_SEC);
+        guide.at_seconds = Math.min(max, Math.max(0, Number(seconds.value) || 0));
+        frameHint.textContent = "秒 · 帧 " + Math.round(guide.at_seconds * PX_PER_SEC);
+        if (saveValue) { seconds.value = guide.at_seconds.toFixed(2); save(); }
+      };
+      // input 负责立即刷新帧号并保存数值；save 不会重绘编辑器，因此不会打断输入。
+      seconds.addEventListener("input", () => { syncGuideTime(false); save(); });
+      seconds.addEventListener("change", () => syncGuideTime(true));
+      head.append(mk("span", "h3s-hint", "时间"), seconds, frameHint);
+      const del = mk("button", "h3s-btn", "删除");
+      del.addEventListener("click", () => {
+        guides.splice(index, 1); resetGuideAutoHeight(); save(); renderEditor();
+      });
+      head.appendChild(del);
+      card.appendChild(head);
+
+      if (guide.kind === "image" || guide.kind === "image_audio") {
+        const row = mk("div", "h3s-row");
+        row.appendChild(mk("span", "h3s-hint", "图片："));
+        if (guide.image) {
+          const preview = document.createElement("img");
+          preview.src = api.apiURL("/view?filename=" + encodeURIComponent(guide.image) + "&type=input");
+          preview.style.cssText = "width:44px;height:30px;object-fit:cover;border-radius:3px;background:#000;";
+          guideImagePreviews.push(preview);
+          row.append(preview, mk("span", "h3s-hint", guide.image_label || guide.image));
+          const clear = mk("button", "h3s-btn", "移除");
+          clear.addEventListener("click", () => {
+            guide.image = ""; guide.image_label = ""; resetGuideAutoHeight(); save(); renderEditor();
+          });
+          row.appendChild(clear);
+        }
+        const upload = mk("button", "h3s-btn", guide.image ? "替换图片" : "上传图片");
+        upload.addEventListener("click", () => pickImage(guide));
+        row.appendChild(upload);
+        if (Array.isArray(s.refs) && s.refs.length) {
+          const refPick = document.createElement("select");
+          refPick.innerHTML = '<option value="">使用本段参考图…</option>';
+          s.refs.forEach((name) => {
+            const opt = document.createElement("option"); opt.value = name; opt.textContent = name; refPick.appendChild(opt);
+          });
+          refPick.addEventListener("change", () => {
+            if (!refPick.value) return;
+            guide.image = refPick.value; guide.image_label = refPick.value;
+            resetGuideAutoHeight(); save(); renderEditor();
+          });
+          row.appendChild(refPick);
+        }
+        card.appendChild(row);
+      }
+
+      if (guide.kind === "audio" || guide.kind === "image_audio") {
+        const row = mk("div", "h3s-row");
+        row.appendChild(mk("span", "h3s-hint", "音频："));
+        if (guide.audio) {
+          row.appendChild(mk("span", "h3s-hint", "♪ " + (guide.audio_label || guide.audio)));
+          const play = document.createElement("audio");
+          play.controls = true; play.preload = "metadata";
+          play.src = api.apiURL("/view?filename=" + encodeURIComponent(guide.audio) + "&type=input");
+          play.style.cssText = "height:24px;max-width:160px;";
+          row.appendChild(play);
+          const clear = mk("button", "h3s-btn", "移除");
+          clear.addEventListener("click", () => {
+            guide.audio = ""; guide.audio_label = ""; resetGuideAutoHeight(); save(); renderEditor();
+          });
+          row.appendChild(clear);
+        }
+        const upload = mk("button", "h3s-btn", guide.audio ? "替换音频" : "上传音频");
+        upload.addEventListener("click", () => pickAudio(guide));
+        row.appendChild(upload);
+        const library = document.createElement("select");
+        library.style.maxWidth = "150px"; library.innerHTML = '<option value="">音频库…</option>';
+        library.addEventListener("change", () => {
+          if (!library.value) return;
+          guide.audio = library.value; guide.audio_label = library.value;
+          resetGuideAutoHeight(); save(); renderEditor();
+        });
+        row.appendChild(library);
+        api.fetchApi("/h3director/list_audio").then((r) => r.json()).then((data) => {
+          (data.files || []).forEach((file) => {
+            const opt = document.createElement("option"); opt.value = file.name; opt.textContent = file.name; library.appendChild(opt);
+          });
+        }).catch(() => { /* 旧后端无音频库时仍可上传 */ });
+        card.appendChild(row);
+      }
+      body.appendChild(card);
+    });
+    wrap.appendChild(body);
+    editor.appendChild(wrap);
+    if (hasManualGuideHeight) resizeGuideImages(Number(savedGuideSize.height));
+    // Guide 轨道与视频参考区使用独立尺寸字段、独立把手，调一边不会影响另一边。
+    attachBottomBar(wrap, 260, 64, (width, height, finished) => {
+      resizeGuideImages(height);
+      if (!finished) return;
+      // 用户手动调整时保存高度；新增/删除锚点会通过 resetGuideAutoHeight 回到自动高度。
+      s.guide_area_size = { width: Math.round(width), height: Math.round(height), manual_height: true };
+      save();
+    });
+  }
+
   /* ================= 视频界面（v2.1 独立整版）=================
      布局参考 WhatDreamsCost：上方参考视频大缩略图（点击即播放预览），
      下方参考照片（外观），底部成片预览。动作/运镜/节奏跟 <Video N>，
@@ -2680,6 +2954,7 @@ function buildStudio(node) {
       ctl.appendChild(mk("span", "h3s-hint", "（加载参考视频后可播放预览）"));
     }
     editor.appendChild(ctl);
+    appendGuideTrack(s, "视频");
 
     /* ======== ⑤ 底部提示词（含四段式模板，v2.6）======== */
     const tplRow = mk("div", "h3s-row");
@@ -2747,6 +3022,7 @@ function buildStudio(node) {
     vta.style.cssText += "flex:none;width:100%;height:84px;";
     editor.appendChild(vta);
 
+    if (!SHOW_SAVED_SEGMENT_PREVIEW) { autoFitCompactPanel(); return; }
     /* ======== ⑥ 成片预览（v2.8，与创作界面同款：可拖大 + 放大查看）======== */
     const pvWrap = mk("div", "h3s-pv");
     pvWrap.style.cssText = "flex:1;display:flex;flex-direction:column;min-height:240px;gap:4px;";
@@ -3253,6 +3529,7 @@ function buildStudio(node) {
     });
     editor.appendChild(pta);
     attachBottomBar(pta, 240, 60);
+    appendGuideTrack(s, "文本");
 
     /* 文本界面 AI：和创作界面共用同一份后端 API 配置，但只发送当前段草稿、
        全局提示词和可选的上段尾帧；生成结果直接写回当前文本段。 */
@@ -3367,6 +3644,7 @@ function buildStudio(node) {
       if (textAiPanel !== openedPanel) return;
     });
 
+    if (!SHOW_SAVED_SEGMENT_PREVIEW) { autoFitCompactPanel(); return; }
     /* ======== ③ 本段成片预览（与其他界面同款）======== */
     const pvWrap = mk("div", "h3s-pv");
     pvWrap.style.cssText = "flex:1;display:flex;flex-direction:column;min-height:240px;gap:4px;";
@@ -5104,8 +5382,17 @@ function buildStudio(node) {
       if (!Array.isArray(s.video_refs)) s.video_refs = [];
       if (!s.video_labels || typeof s.video_labels !== "object") s.video_labels = {};
       if (!s.video_audio_refs || typeof s.video_audio_refs !== "object") s.video_audio_refs = {};
-      const refVideoTitle = mk("div", "h3s-hint", "视频参考（最多 3 个；参与参考生成，可在提示词中用 <Video N>）：");
-      editor.appendChild(refVideoTitle);
+      // 视频参考与帧锚点一样可独立折叠；收起时不占用预览区和拖拽条的高度。
+      const refVideoWrap = document.createElement("details");
+      refVideoWrap.className = "h3s-slrow";
+      refVideoWrap.style.cssText = "display:block;margin-top:5px;min-width:260px;overflow:visible;";
+      refVideoWrap.open = s.video_ref_area_open !== false;
+      refVideoWrap.addEventListener("toggle", () => { s.video_ref_area_open = refVideoWrap.open; save(); });
+      const refVideoTitle = document.createElement("summary");
+      refVideoTitle.className = "h3s-hint";
+      refVideoTitle.style.cssText = "cursor:pointer;color:#9fd0ff;user-select:none;";
+      refVideoTitle.textContent = "视频参考（" + s.video_refs.length + "/3 个；参与参考生成，可在提示词中用 <Video N>）";
+      refVideoWrap.appendChild(refVideoTitle);
 
       const uploadRefVideo = async (file, replaceIndex = -1) => {
         if (!/\.(mp4|webm|mov|mkv|avi)$/i.test(file.name)) throw new Error("仅支持 mp4/webm/mov/mkv/avi 视频");
@@ -5147,19 +5434,26 @@ function buildStudio(node) {
       };
 
       const refVideoGrid = mk("div", "h3s-refs");
-      // h3s-refs 的通用样式默认只有 64px 高，视频卡片会把“视频声音参考”
-      // 一行裁掉。视频参考区独立使用较高容器，并记住用户拖拽后的尺寸。
-      refVideoGrid.style.cssText = "height:210px;min-height:180px;align-items:flex-start;overflow:auto;resize:none;";
+      const hasRefVideos = s.video_refs.length > 0;
+      // 有视频时需要为预览和“视频声音参考”留出高度；没有视频时只显示上传按钮，
+      // 必须收回为紧凑高度，不能留着一整块 210px 的空参考区。
+      refVideoGrid.style.cssText = hasRefVideos
+        ? "height:210px;min-height:180px;align-items:flex-start;overflow:auto;resize:none;"
+        : "height:64px;min-height:64px;align-items:center;overflow:visible;resize:none;";
       const savedRefVideoSize = s.video_ref_area_size;
       if (savedRefVideoSize && Number.isFinite(Number(savedRefVideoSize.width))
         && Number.isFinite(Number(savedRefVideoSize.height))) {
         refVideoGrid.style.flex = "none";
         refVideoGrid.style.width = Math.max(260, Math.round(Number(savedRefVideoSize.width))) + "px";
-        refVideoGrid.style.height = Math.max(180, Math.round(Number(savedRefVideoSize.height))) + "px";
+        // 旧的高度只在确实有视频卡片时恢复；空区永远保持紧凑。
+        if (hasRefVideos) refVideoGrid.style.height = Math.max(180, Math.round(Number(savedRefVideoSize.height))) + "px";
       }
       s.video_refs.forEach((name, index) => {
         const card = mk("div", null);
-        card.style.cssText = "width:220px;flex:none;border:1px solid #3a5a7a;border-radius:7px;overflow:hidden;background:#101318;";
+        // 卡片与参考区同高；中间播放器使用 flex 填满剩余空间，拖动下方把手时
+        // 视频画面会立刻变高/变矮，而不是只有外框变化。
+        card.style.cssText = "width:220px;height:calc(100% - 8px);display:flex;flex-direction:column;flex:none;"
+          + "border:1px solid #3a5a7a;border-radius:7px;overflow:hidden;background:#101318;";
         const head = mk("div", "h3s-row");
         head.style.cssText = "padding:4px 5px;gap:5px;";
         const badge = mk("span", "num", "V" + (index + 1));
@@ -5180,6 +5474,12 @@ function buildStudio(node) {
           const removed = s.video_refs.splice(index, 1)[0];
           delete s.video_labels[removed];
           delete s.video_audio_refs[removed];
+          if (s.video_refs.length === 0) {
+            const old = s.video_ref_area_size || {};
+            s.video_ref_area_size = Number.isFinite(Number(old.width))
+              ? { width: Math.round(Number(old.width)), height: null }
+              : null;
+          }
           save(); renderEditor();
         });
         head.append(reload, remove);
@@ -5187,7 +5487,7 @@ function buildStudio(node) {
         preview.src = api.apiURL("/view?filename=" + encodeURIComponent(name) + "&type=input");
         preview.controls = true;
         preview.preload = "metadata";
-        preview.style.cssText = "display:block;width:220px;height:124px;object-fit:contain;background:#000;";
+        preview.style.cssText = "display:block;width:100%;height:auto;min-height:0;flex:1;object-fit:contain;background:#000;";
         const soundRow = mk("label", "h3s-row");
         soundRow.style.cssText = "padding:5px 7px;gap:5px;font-size:10px;cursor:pointer;";
         const soundCheck = document.createElement("input");
@@ -5209,21 +5509,26 @@ function buildStudio(node) {
       if (s.video_refs.length < 3) {
         const add = mk("button", "h3s-btn", "+ 上传参考视频");
         // 与左侧参考视频卡片等宽、同一高度，避免小按钮显得突兀。
-        add.style.cssText = "height:calc(100% - 8px);width:220px;min-width:220px;flex:none;";
+        add.style.cssText = (hasRefVideos ? "height:calc(100% - 8px);" : "height:48px;")
+          + "width:220px;min-width:220px;flex:none;";
         add.title = "最多 3 个；这些视频会参与 H3 参考生成";
         add.addEventListener("click", () => chooseRefVideo());
         refVideoGrid.appendChild(add);
       } else {
         refVideoGrid.appendChild(mk("span", "h3s-hint", "已达 3 个参考视频上限"));
       }
-      editor.appendChild(refVideoGrid);
+      refVideoWrap.appendChild(refVideoGrid);
       // 视频参考区也有专属把手；放在该区域底部，避免和本段音频的把手混淆。
       attachBottomBar(refVideoGrid, 260, 180, (width, height, finished) => {
         if (!finished) return;
         s.video_ref_area_size = { width: Math.round(width), height: Math.round(height) };
         save();
       });
+      editor.appendChild(refVideoWrap);
     }
+
+    // 视频参考在上，帧锚点在下；两块区域各自保留宽高和拖拽把手。
+    appendGuideTrack(s, "创作");
 
     /* ---- 音频可视化裁剪：波形 + 左右拖柄选区间 + 保留/删除模式 + 起始偏移 ---- */
     if (s.audio) {
@@ -5341,6 +5646,7 @@ function buildStudio(node) {
       editor.appendChild(offRow);
     }
 
+    if (!SHOW_SAVED_SEGMENT_PREVIEW) { autoFitCompactPanel(); return; }
     // ---- 本段成片预览：点击段落即可查看已生成视频（带声音），方便定位想重跑的段 ----
     const pvWrap = mk("div", "h3s-pv");
     /* pvWrap 作为编辑区的弹性填充层：display:flex 后 pvBox 的 flex:1 才生效 */
@@ -5409,7 +5715,7 @@ function buildStudio(node) {
 
   renderTimeline();
   renderEditor();
-  node.setSize([Math.max(node.size[0], 760), Math.max(node.size[1], 640)]);
+  node.setSize([Math.max(node.size[0], 760), Math.max(node.size[1], 320)]);
   node.__h3Reload = reloadFromWidget;
   return box;
 }
@@ -5435,13 +5741,15 @@ app.registerExtension({
       /* 容器高度跟随节点尺寸（原来写死 430px：节点拉大后下半截全是黑边，
          "只能左右拉伸不能上下放大"的根因）。210 = 标题+接口行+标量widget+边距的实测占用。 */
       const TOP_RESERVED = 210;
-      const calcH = () => Math.max(300, this.size[1] - TOP_RESERVED);
+      // 紧凑模式由 buildStudio 按实际内容主动设定节点高度；这里不能再强制
+      // 300px 的 DOM 最小高度，否则末尾会留下随锚点数量跳动的灰色空白。
+      const calcH = () => Math.max(0, this.size[1] - TOP_RESERVED);
       if (dw) dw.computedSize = () => [this.size[0], calcH()];
       /* 新版前端（Vue）用 computeLayoutSize 参与节点最小尺寸/布局计算。
          不声明时 DOMWidgetImpl 默认 minWidth=0/minHeight=50：节点一旦被折叠展开、
          自动排版等路径重算最小尺寸，宽度会塌到约 370px——面板"点击后变窄不可控"。
          声明后节点最小宽度被钳在设计值附近，任何路径都不会塌。 */
-      if (dw) dw.computeLayoutSize = () => ({ minHeight: 300, minWidth: 700, maxHeight: undefined });
+      if (dw) dw.computeLayoutSize = () => ({ minHeight: 0, minWidth: 700, maxHeight: undefined });
       /* 宽度看门狗：某些前端版本里 widget.width 会被写入一次旧值，之后 wrapper
          宽度就一直用它而不是节点宽度（面板比节点窄一截且无法恢复）。
          定时清掉 widget.width 并把 wrapper 宽度钳回节点宽度，幂等无副作用。 */
