@@ -126,10 +126,8 @@ def _config_inputs(include_object_key=False):
         "endpoint": ("STRING", {"default": _env(ENV_ENDPOINT), "multiline": False}),
         "region": ("STRING", {"default": _env(ENV_REGION), "multiline": False}),
         "bucket": ("STRING", {"default": _env(ENV_BUCKET), "multiline": False}),
-        # ``password`` is understood by some ComfyUI frontends.  The bundled
-        # frontend extension also applies the same masking to older versions.
-        "access_key_id": ("STRING", {"default": "", "multiline": False, "password": True}),
-        "access_key_secret": ("STRING", {"default": "", "multiline": False, "password": True}),
+        "access_key_id": ("STRING", {"default": "", "multiline": False}),
+        "access_key_secret": ("STRING", {"default": "", "multiline": False}),
         "security_token": ("STRING", {"default": "", "multiline": False}),
         "use_system_proxy": ("BOOLEAN", {"default": False}),
     }
@@ -362,4 +360,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AliyunOSSUploadLatent": "阿里云 OSS 上传 Latent（REST）",
     "AliyunOSSDownloadLatent": "阿里云 OSS 下载 Latent（REST）",
 }
-
