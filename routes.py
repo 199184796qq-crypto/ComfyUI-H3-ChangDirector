@@ -26,7 +26,7 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, web
 OUTPUT_DIR = folder_paths.get_output_directory()
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 PROJECT_ROOT = os.path.join(VIDEO_DIR, "h3director")
-BACKEND_VERSION = "2.27.1"  # 前端 JS 据此判断后端代码是否过旧（提示用户重启 ComfyUI）
+BACKEND_VERSION = "2.27.5"  # 前端 JS 据此判断后端代码是否过旧（提示用户重启 ComfyUI）
 MAX_AUDIO_UPLOAD = 100 * 1024 * 1024
 MAX_VIDEO_UPLOAD = 2 * 1024 * 1024 * 1024
 MAX_CONTEXT_VIDEO_UPLOAD = 200 * 1024 * 1024
@@ -375,6 +375,25 @@ def _project_dir(value):
     return os.path.join(PROJECT_ROOT, _safe_project_id(value))
 
 
+def _safe_filename_prefix(value):
+    prefix = str(value or "").strip().strip('"').strip("'") or "ComfyUI"
+    prefix = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", prefix).strip(" ._")
+    return prefix or "ComfyUI"
+
+
+def _segment_video_prefix(mode, filename_prefix):
+    marker = {"video": "v", "text": "t"}.get(mode, "")
+    return "%s%s_seg" % (_safe_filename_prefix(filename_prefix), marker)
+
+
+def _legacy_segment_video_prefix(mode):
+    return {"video": "漫剧v_seg", "text": "漫剧t_seg"}.get(mode, "漫剧_seg")
+
+
+def _segment_video_name(seg, mode, filename_prefix):
+    return "%s%d_00001_.mp4" % (_segment_video_prefix(mode, filename_prefix), int(seg))
+
+
 def _write_upload(upload, path, max_bytes):
     total = 0
     try:
@@ -424,22 +443,27 @@ def register_routes():
     @app.routes.get("/h3director/status")
     async def status(request):
         # 段数不限（导演台可无限加段）：glob 扫描实际存在的 segN 文件动态发现
-        # v2.3：mode=video 时扫描视频界面的独立产出（漫剧v_/tailv_ 前缀）
-        # v2.11：mode=text 时扫描文本界面的独立产出（漫剧t_/tailt_ 前缀）
+        # MP4 使用当前 filename_prefix；v / t 标记继续隔离视频页和文本页。
         _mode = request.query.get("mode", "create")
         project_dir = _project_dir(request.query.get("project_id"))
-        vpat, tpat = {"video": ("漫剧v_seg", "tailv_seg"),
-                      "text": ("漫剧t_seg", "tailt_seg")}.get(_mode, ("漫剧_seg", "tail_seg"))
+        vpat = _segment_video_prefix(_mode, request.query.get("filename_prefix"))
+        legacy_vpat = _legacy_segment_video_prefix(_mode)
+        tpat = {"video": "tailv_seg", "text": "tailt_seg"}.get(_mode, "tail_seg")
         ids = set()
-        for pat in (vpat + "*_*.mp4", tpat + "*_*.png"):
+        for pat in (glob.escape(vpat) + "*_*.mp4",
+                    glob.escape(legacy_vpat) + "*_*.mp4",
+                    glob.escape(tpat) + "*_*.png"):
             for p in glob.glob(os.path.join(project_dir, pat)):
                 m = re.search(r"seg(\d+)_", os.path.basename(p))
                 if m:
                     ids.add(int(m.group(1)))
         segs = {}
         for i in sorted(ids):
-            tail = _latest(os.path.join(project_dir, "%s%d_*.png" % (tpat, i)))
-            vid = _latest(os.path.join(project_dir, "%s%d_*.mp4" % (vpat, i)))
+            tail = _latest(os.path.join(project_dir, "%s%d_*.png" % (glob.escape(tpat), i)))
+            vid = _latest(os.path.join(project_dir, "%s%d_*.mp4" % (glob.escape(vpat), i)))
+            if not vid:
+                vid = _latest(os.path.join(
+                    project_dir, "%s%d_*.mp4" % (glob.escape(legacy_vpat), i)))
             segs[str(i)] = {
                 "tail": bool(tail),
                 "video": ("video/" + os.path.basename(vid)) if vid else None,
@@ -453,18 +477,19 @@ def register_routes():
 
     @app.routes.get("/h3director/video")
     async def seg_video(request):
-        """段视频预览流。ComfyUI 内置 /view 对中文文件名（漫剧_segN）会 404（实测），
-        插件自己 serve——aiohttp FileResponse 自带 Range/206 与 video/mp4 Content-Type。"""
+        """按当前 filename_prefix 提供段视频预览流，并兼容旧“漫剧”缓存。"""
         try:
             seg = int(request.query.get("seg", "0"))
         except (TypeError, ValueError):
             return web.Response(status=400, text="bad seg")
         _mode = request.query.get("mode", "create")
-        name = ({"video": "漫剧v_seg%d_00001_.mp4", "text": "漫剧t_seg%d_00001_.mp4"}
-                .get(_mode, "漫剧_seg%d_00001_.mp4")) % seg
+        name = _segment_video_name(seg, _mode, request.query.get("filename_prefix"))
         path = os.path.join(_project_dir(request.query.get("project_id")), name)
         if not os.path.exists(path):
-            return web.Response(status=404, text="segment video not found")
+            legacy_name = "%s%d_00001_.mp4" % (_legacy_segment_video_prefix(_mode), seg)
+            path = os.path.join(_project_dir(request.query.get("project_id")), legacy_name)
+            if not os.path.exists(path):
+                return web.Response(status=404, text="segment video not found")
         return web.FileResponse(path)
 
     @app.routes.get("/h3director/tail")
@@ -498,18 +523,20 @@ def register_routes():
             return web.json_response({"ok": False, "error": "bad json"}, status=400)
         _mode = (data.get("mode") or "create")
         project_dir = _project_dir(data.get("project_id"))
-        pats = {"video": ("漫剧v_seg", "tailv_seg"),
-                "text": ("漫剧t_seg", "tailt_seg")}.get(_mode, ("漫剧_seg", "tail_seg"))
+        vpat = _segment_video_prefix(_mode, data.get("filename_prefix"))
+        legacy_vpat = _legacy_segment_video_prefix(_mode)
+        tpat = {"video": "tailv_seg", "text": "tailt_seg"}.get(_mode, "tail_seg")
         deleted, failed = 0, 0
-        for pat in pats:
-            for p in glob.glob(os.path.join(project_dir, pat + "*_*.mp4")) \
-                   + glob.glob(os.path.join(project_dir, pat + "*_*.png")) \
-                   + glob.glob(os.path.join(project_dir, pat + "*_*.json")):
-                try:
-                    os.remove(p)
-                    deleted += 1
-                except OSError:
-                    failed += 1
+        paths = (glob.glob(os.path.join(project_dir, glob.escape(vpat) + "*_*.mp4"))
+                 + glob.glob(os.path.join(project_dir, glob.escape(legacy_vpat) + "*_*.mp4"))
+                 + glob.glob(os.path.join(project_dir, glob.escape(tpat) + "*_*.png"))
+                 + glob.glob(os.path.join(project_dir, glob.escape(legacy_vpat) + "*_*.json")))
+        for p in set(paths):
+            try:
+                os.remove(p)
+                deleted += 1
+            except OSError:
+                failed += 1
         return web.json_response({"ok": True, "deleted": deleted, "failed": failed})
 
     @app.routes.post("/h3director/extract_tail")

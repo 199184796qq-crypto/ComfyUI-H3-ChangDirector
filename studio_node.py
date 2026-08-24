@@ -289,7 +289,7 @@ def _latest(pattern):
 
 
 # 三个界面独立命名（v2.3 视频 / v2.11 文本）：各页产出互不覆盖
-_SEG_NAME = {"create": "漫剧_seg%d_00001_", "video": "漫剧v_seg%d_00001_", "text": "漫剧t_seg%d_00001_"}
+_LEGACY_SEG_NAME = {"create": "漫剧_seg%d_00001_", "video": "漫剧v_seg%d_00001_", "text": "漫剧t_seg%d_00001_"}
 _TAIL_NAME = {"create": "tail_seg%d_00001_.png", "video": "tailv_seg%d_00001_.png", "text": "tailt_seg%d_00001_.png"}
 
 
@@ -302,12 +302,29 @@ def _project_dir(project_id):
     return os.path.join(PROJECT_ROOT, _safe_project_id(project_id))
 
 
-def _seg_video(seg, mode="create", project_id="default"):
-    return os.path.join(_project_dir(project_id), (_SEG_NAME.get(mode, _SEG_NAME["create"]) % seg) + ".mp4")
+def _seg_video(seg, mode="create", project_id="default", filename_prefix="ComfyUI"):
+    """Canonical segment MP4 named from the Director's filename_prefix.
+
+    Replacing only the historic ``漫剧`` token preserves the three established
+    mode markers: ``prefix_seg``, ``prefixv_seg`` and ``prefixt_seg``.
+    """
+    marker = {"video": "v", "text": "t"}.get(mode, "")
+    name = "%s%s_seg%d_00001_.mp4" % (
+        _safe_export_prefix(filename_prefix), marker, int(seg))
+    return os.path.join(_project_dir(project_id), name)
+
+
+def _legacy_seg_video(seg, mode="create", project_id="default"):
+    return os.path.join(
+        _project_dir(project_id),
+        (_LEGACY_SEG_NAME.get(mode, _LEGACY_SEG_NAME["create"]) % seg) + ".mp4")
 
 
 def _seg_meta(seg, mode="create", project_id="default"):
-    return os.path.join(_project_dir(project_id), (_SEG_NAME.get(mode, _SEG_NAME["create"]) % seg) + ".json")
+    # 配置缓存继续使用旧固定名称；只改 filename_prefix 时无需重跑模型。
+    return os.path.join(
+        _project_dir(project_id),
+        (_LEGACY_SEG_NAME.get(mode, _LEGACY_SEG_NAME["create"]) % seg) + ".json")
 
 
 def _seg_tail(seg, mode="create", project_id="default"):
@@ -644,6 +661,56 @@ def _conditioning_after_motion_trim(base_conditioning, motion_conditioning,
         meta["minimax_frame_count"] = visible_frames
         out.append([embedding, meta])
     return out
+
+
+def _segment_second_pass_config(seg_cfg, defaults=None):
+    """Return validated second-pass settings for one segment.
+
+    Node-level widgets are accepted only as an upgrade fallback for workflows
+    saved before second-pass settings moved into each segment JSON object.
+    """
+    seg_cfg = seg_cfg if isinstance(seg_cfg, dict) else {}
+    defaults = defaults if isinstance(defaults, dict) else {}
+
+    def _value(key, fallback_key, fallback):
+        return seg_cfg[key] if key in seg_cfg else defaults.get(fallback_key, fallback)
+
+    def _number(key, fallback_key, fallback, minimum, maximum, integer=False):
+        try:
+            value = float(_value(key, fallback_key, fallback))
+        except (TypeError, ValueError):
+            value = float(fallback)
+        value = max(minimum, min(maximum, value))
+        return int(round(value)) if integer else value
+
+    enabled_raw = _value("second_pass_enabled", "enabled", False)
+    sampler = str(_value("second_pass_sampler", "sampler", "euler"))
+    if sampler not in comfy.samplers.SAMPLER_NAMES:
+        sampler = "euler"
+    scheduler = str(_value("second_pass_scheduler", "scheduler", "beta"))
+    if scheduler not in comfy.samplers.SCHEDULER_NAMES:
+        scheduler = "beta"
+    resize_method = str(_value(
+        "second_pass_resize_method", "resize_method", "bilinear"))
+    if resize_method not in SECOND_PASS_UPSCALE_METHODS:
+        resize_method = "bilinear"
+    resize_device = "cpu" if str(_value(
+        "second_pass_resize_device", "resize_device", "gpu")).lower() == "cpu" else "gpu"
+    if resize_method == "nvidia_rtx_vsr":
+        resize_device = "gpu"
+    return {
+        "enabled": enabled_raw is True or enabled_raw == 1,
+        "megapixels": _number(
+            "second_pass_megapixels", "megapixels", 1.0, 0.1, 16.0),
+        "steps": _number("second_pass_steps", "steps", 4, 1, 50, integer=True),
+        "denoise": _number("second_pass_denoise", "denoise", 0.2, 0.01, 1.0),
+        "sampler": sampler,
+        "scheduler": scheduler,
+        "resize_method": resize_method,
+        "resize_device": resize_device,
+        "resize_batch_size": _number(
+            "second_pass_resize_batch_size", "resize_batch_size", 8, 1, 64, integer=True),
+    }
 
 
 def _second_pass_resolution(source_width, source_height, megapixels, multiple=32):
@@ -1238,7 +1305,8 @@ def _write_segment_video(frames_u8, audio, seg, ffmpeg,
                          audio_enabled=True,
                          audio_trim_start=0.0, audio_trim_end=0.0, audio_offset=0.0,
                          audio_trim_mode="keep", out_fps=24, mode="create",
-                         amb_audio=None, amb_vol=0.25, project_id="default"):
+                         amb_audio=None, amb_vol=0.25, project_id="default",
+                         filename_prefix="ComfyUI"):
     """frames_u8: [N,H,W,3] uint8；audio: dict(waveform[B,C,L], sample_rate)。写出 mp4 + 尾帧。
     custom_audio: 用户上传的本段音频绝对路径（配音/台词），可选。
     audio_mode: replace=自定义音频顶替 H3 原声；mix=与 H3 原声混合（原声自动压到 60%）。
@@ -1253,7 +1321,7 @@ def _write_segment_video(frames_u8, audio, seg, ffmpeg,
     os.close(fd)
     fd, tmpout = tempfile.mkstemp(prefix="_h3_mux_", suffix=".mp4", dir=work_dir)
     os.close(fd)
-    out = _seg_video(seg, mode, project_id)
+    out = _seg_video(seg, mode, project_id, filename_prefix)
 
     def _run_video_cmd(command, **kwargs):
         try:
@@ -1405,13 +1473,14 @@ def _fit_frame(frame, target_size):
     return canvas
 
 
-def _read_segment_video(seg, mode="create", project_id="default", target_size=None, target_fps=FPS):
+def _read_segment_video(seg, mode="create", project_id="default", target_size=None,
+                        target_fps=FPS, filename_prefix="ComfyUI"):
     """从 mp4 还原 frames float tensor + audio dict（用于缓存段的输出重建）。"""
     import cv2
     import imageio_ffmpeg
     import wave as wave_mod
     import io
-    path = _seg_video(seg, mode, project_id)
+    path = _seg_video(seg, mode, project_id, filename_prefix)
     cap = cv2.VideoCapture(path)
     source_fps = float(cap.get(cv2.CAP_PROP_FPS) or target_fps)
     frames = []
@@ -1454,9 +1523,10 @@ def _read_segment_video(seg, mode="create", project_id="default", target_size=No
                                    "fps": max(1, round(source_fps))}
 
 
-def _read_segment_preview(seg, mode="create", project_id="default", target_size=None):
+def _read_segment_preview(seg, mode="create", project_id="default", target_size=None,
+                          filename_prefix="ComfyUI"):
     import cv2
-    path = _seg_video(seg, mode, project_id)
+    path = _seg_video(seg, mode, project_id, filename_prefix)
     cap = cv2.VideoCapture(path)
     source_fps = float(cap.get(cv2.CAP_PROP_FPS) or FPS)
     source_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -1599,7 +1669,8 @@ class H3DirectorStudio:
                       second_pass_megapixels=1.0, second_pass_steps=4,
                       second_pass_denoise=0.2, second_pass_sampler="euler",
                       second_pass_scheduler="beta", second_pass_resize_method="bilinear",
-                      second_pass_resize_device="gpu", second_pass_resize_batch_size=8):
+                      second_pass_resize_device="gpu", second_pass_resize_batch_size=8,
+                      filename_prefix="ComfyUI"):
         # 0) 计算本段时长与帧数（缺失时用节点默认时长），帧数对齐 ≡5 (mod 17)
         # 段级分辨率覆盖（v2.8）：每段视频尺寸可不同；留空=跟随节点宽高
         _wo = int(seg_cfg.get("width") or 0)
@@ -2147,7 +2218,8 @@ class H3DirectorStudio:
                                         out_fps=seg_cfg.get("fps", 24), mode=mode,
                                         amb_audio=amb_audio,
                                         amb_vol=seg_cfg.get("amb_vol", 0.25),
-                                        project_id=project_id)
+                                        project_id=project_id,
+                                        filename_prefix=filename_prefix)
 
         del frames_u8, audio
         gc.collect()
@@ -2191,21 +2263,18 @@ class H3DirectorStudio:
         if 外部文本 is not None:
             segments[external_text_target - 1]["prompt"] = str(外部文本)
 
-        second_pass_enabled = bool(二采放大)
-        second_pass_megapixels = max(0.1, min(16.0, float(二采百万像素 or 1.0)))
-        second_pass_steps = max(1, min(50, int(二采步数 or 4)))
-        second_pass_denoise = max(0.01, min(1.0, float(二采降噪 or 0.2)))
-        second_pass_sampler = (str(二采采样器) if str(二采采样器) in comfy.samplers.SAMPLER_NAMES
-                               else "euler")
-        second_pass_scheduler = (str(二采调度器) if str(二采调度器) in comfy.samplers.SCHEDULER_NAMES
-                                 else "beta")
-        second_pass_resize_method = (str(二采缩放方法)
-                                     if str(二采缩放方法) in SECOND_PASS_UPSCALE_METHODS
-                                     else "bilinear")
-        second_pass_resize_device = "cpu" if str(二采缩放设备).lower() == "cpu" else "gpu"
-        if second_pass_resize_method == "nvidia_rtx_vsr":
-            second_pass_resize_device = "gpu"
-        second_pass_resize_batch_size = max(1, min(64, int(二采缩放批大小 or 8)))
+        # 旧的节点级 widget 只作为旧工作流升级默认值；新版实际配置保存在每段 JSON 中。
+        second_pass_defaults = _segment_second_pass_config({}, {
+            "enabled": bool(二采放大),
+            "megapixels": 二采百万像素,
+            "steps": 二采步数,
+            "denoise": 二采降噪,
+            "sampler": 二采采样器,
+            "scheduler": 二采调度器,
+            "resize_method": 二采缩放方法,
+            "resize_device": 二采缩放设备,
+            "resize_batch_size": 二采缩放批大小,
+        })
 
         # 所有界面和生成方式都允许两种续接方式。它们只彼此互斥，
         # 且均可关闭；不再因段号或生成方式被后台强制改写。
@@ -2360,14 +2429,13 @@ class H3DirectorStudio:
             MotionContext画面帧数, int(MotionContext音频帧数)))
         report.append("成片导出 | 目录 %s | 命名 %s_片段号(4位)_视频短边_年月日_时_分.mp4" % (
             _resolve_export_directory(output_dir), filename_prefix))
-        if second_pass_enabled:
-            report.append("二采放大：开启 | %.1fMP | %d步 %s/%s | 降噪 %.2f | %s/%s | 模型 %s" % (
-                second_pass_megapixels, second_pass_steps, second_pass_sampler,
-                second_pass_scheduler, second_pass_denoise,
-                second_pass_resize_method, second_pass_resize_device,
-                "独立二采模型" if 二采模型 is not None else "复用本段一采模型"))
-        else:
-            report.append("二采放大：关闭")
+        enabled_second_pass_segments = [
+            str(index + 1) for index, segment in enumerate(segments)
+            if _segment_second_pass_config(segment, second_pass_defaults)["enabled"]
+        ]
+        report.append("二采放大：分段独立 | 开启段 %s | 模型 %s" % (
+            ",".join(enabled_second_pass_segments) if enabled_second_pass_segments else "无",
+            "独立二采模型" if 二采模型 is not None else "复用各段一采模型"))
         if 外部文本 is not None:
             report.append("外部文本：已连接并覆盖段%d提示词" % external_text_target)
         if low_vram_mode:
@@ -2386,6 +2454,17 @@ class H3DirectorStudio:
             if not seg_cfg.get("enabled", True):
                 report.append("段%d: 跳过（未启用）" % seg_idx)
                 continue
+
+            second_pass_cfg = _segment_second_pass_config(seg_cfg, second_pass_defaults)
+            second_pass_enabled = second_pass_cfg["enabled"]
+            second_pass_megapixels = second_pass_cfg["megapixels"]
+            second_pass_steps = second_pass_cfg["steps"]
+            second_pass_denoise = second_pass_cfg["denoise"]
+            second_pass_sampler = second_pass_cfg["sampler"]
+            second_pass_scheduler = second_pass_cfg["scheduler"]
+            second_pass_resize_method = second_pass_cfg["resize_method"]
+            second_pass_resize_device = second_pass_cfg["resize_device"]
+            second_pass_resize_batch_size = second_pass_cfg["resize_batch_size"]
 
             motion_source = _motion_context_source(seg_cfg)
             motion_local_index = _motion_context_local_index(seg_cfg, k)
@@ -2481,9 +2560,10 @@ class H3DirectorStudio:
             h = _config_hash(run_cfg)
             meta_ok = False
             meta_data = {}
-            video_path = _seg_video(seg_idx, mode, project_id)
+            renamed_internal = False
+            video_path = _seg_video(seg_idx, mode, project_id, filename_prefix)
             meta_path = _seg_meta(seg_idx, mode, project_id)
-            if os.path.exists(video_path) and os.path.exists(meta_path):
+            if os.path.exists(meta_path):
                 try:
                     with open(meta_path, encoding="utf-8") as f:
                         meta_data = json.load(f)
@@ -2491,6 +2571,30 @@ class H3DirectorStudio:
                 except (OSError, ValueError, json.JSONDecodeError):
                     meta_data = {}
                     meta_ok = False
+
+            # filename_prefix 不参与生成哈希：前缀改变时把已有项目缓存改名，
+            # 而不是重新运行模型。2.27.1 及更早版本的“漫剧”文件也会在此迁移。
+            if meta_ok and not os.path.isfile(video_path):
+                project_dir = _project_dir(project_id)
+                candidates = []
+                previous_name = os.path.basename(str(meta_data.get("internal_video_name") or ""))
+                if previous_name:
+                    candidates.append(os.path.join(project_dir, previous_name))
+                candidates.append(_legacy_seg_video(seg_idx, mode, project_id))
+                expected = os.path.realpath(video_path)
+                project_root = os.path.realpath(project_dir)
+                for candidate in candidates:
+                    candidate = os.path.realpath(candidate)
+                    try:
+                        inside_project = os.path.commonpath([project_root, candidate]) == project_root
+                    except ValueError:
+                        inside_project = False
+                    if (inside_project and candidate != expected
+                            and os.path.isfile(candidate)):
+                        os.replace(candidate, video_path)
+                        renamed_internal = True
+                        break
+                meta_ok = os.path.isfile(video_path)
 
             # 本地 latent 模式要保证当前指定的 index+1 主槽位已经写出。
             context_slot = _context_slot_path(上下文保存目录, save_context_index)
@@ -2504,6 +2608,9 @@ class H3DirectorStudio:
 
             generated_now = False
             return_internal_outputs = need_internal_outputs and seg_idx == external_text_target
+            if renamed_internal:
+                report.append("段%d: 缓存已按 filename_prefix 改名 -> %s" % (
+                    seg_idx, os.path.basename(video_path)))
             if meta_ok and not seg_cfg.get("force") and not return_internal_outputs:
                 report.append("段%d: 缓存命中%s，跳过生成" % (
                     seg_idx, "（clip %d 已存在）" % save_context_index if save_context_latent else ""))
@@ -2532,7 +2639,8 @@ class H3DirectorStudio:
                     second_pass_scheduler=second_pass_scheduler,
                     second_pass_resize_method=second_pass_resize_method,
                     second_pass_resize_device=second_pass_resize_device,
-                    second_pass_resize_batch_size=second_pass_resize_batch_size)
+                    second_pass_resize_batch_size=second_pass_resize_batch_size,
+                    filename_prefix=filename_prefix)
                 if return_internal_outputs:
                     output_latent = segment_latent
                     output_positive = segment_positive
@@ -2542,6 +2650,7 @@ class H3DirectorStudio:
                     "schema": CACHE_SCHEMA,
                     "hash": h,
                     "prompt": seg_cfg.get("prompt", ""),
+                    "internal_video_name": os.path.basename(video_path),
                 }
                 ran.append(seg_idx)
                 mc_note = ({"local_latent": "本地 latent（index %d）" % motion_local_index,
@@ -2552,6 +2661,7 @@ class H3DirectorStudio:
                 report.append("段%d: 已生成 -> %s | MotionContext %s | %s" % (
                     seg_idx, os.path.basename(video_path), mc_note, save_note))
             if os.path.exists(video_path):
+                meta_data["internal_video_name"] = os.path.basename(video_path)
                 try:
                     exported_path, export_sig, copied = _export_segment_video(
                         video_path, output_dir, filename_prefix, seg_idx,
@@ -2568,7 +2678,7 @@ class H3DirectorStudio:
                     if copied:
                         report.append("段%d: 已导出 -> %s" % (seg_idx, exported_path))
                 # 新生成段和补导出都会刷新元数据；只改目录/前缀不会触发模型重跑。
-                if generated_now or export_sig:
+                if generated_now or renamed_internal or export_sig:
                     with open(meta_path, "w", encoding="utf-8") as f:
                         json.dump(meta_data, f, ensure_ascii=False)
                 done.append(seg_idx)
@@ -2582,7 +2692,9 @@ class H3DirectorStudio:
             all_frames = []
             all_wavs = []
             for i in done:
-                fr, au = _read_segment_video(i, mode, project_id, target_size=(width, height), target_fps=FPS)
+                fr, au = _read_segment_video(
+                    i, mode, project_id, target_size=(width, height),
+                    target_fps=FPS, filename_prefix=filename_prefix)
                 all_frames.append(fr)
                 all_wavs.append((au["waveform"], int(au["sample_rate"])))
             images = torch.cat(all_frames, dim=0) if all_frames else torch.zeros((1, height, width, 3))
@@ -2609,7 +2721,8 @@ class H3DirectorStudio:
             if external_text_target not in done:
                 raise ValueError("[H3导演台] 当前选中段%d未生成，无法输出单段视频。请选中已启用的段后运行。" % external_text_target)
             images, segment_audio = _read_segment_video(
-                external_text_target, mode, project_id, target_fps=None)
+                external_text_target, mode, project_id, target_fps=None,
+                filename_prefix=filename_prefix)
             waveform = segment_audio["waveform"]
             sr = int(segment_audio["sample_rate"])
             frame_count = images.shape[0]
@@ -2619,7 +2732,9 @@ class H3DirectorStudio:
             images = torch.zeros((1, height, width, 3))
             frame_count = 0
             for i in done:
-                images, count = _read_segment_preview(i, mode, project_id, target_size=(width, height))
+                images, count = _read_segment_preview(
+                    i, mode, project_id, target_size=(width, height),
+                    filename_prefix=filename_prefix)
                 frame_count += count
             sr = 32000
             waveform = torch.zeros((1, 2, 1))

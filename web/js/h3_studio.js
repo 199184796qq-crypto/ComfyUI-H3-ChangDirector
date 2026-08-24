@@ -4,7 +4,7 @@ import { H3_TEXT_TEMPLATES } from "./h3_templates.js";
 
 /* 前端版本号：与 routes.py 的 BACKEND_VERSION 对应。
    status 接口返回的后端版本若与此不一致（用户改了代码但没重启/没强刷），状态栏红字提示。 */
-const H3S_VERSION = "2.27.1";
+const H3S_VERSION = "2.27.5";
 const activeProjectIds = new Map();
 
 function newProjectId() {
@@ -194,20 +194,31 @@ const H3S_DEFAULT_ASPECT = "16:9 (Widescreen)";
 const H3S_DEFAULT_MEGAPIXELS = 0.5;
 const H3S_DEFAULT_MULTIPLE = 32;
 
+function pythonRound(value) {
+  const lower = Math.floor(value);
+  const fraction = value - lower;
+  if (Math.abs(fraction - 0.5) < 1e-10) return lower % 2 === 0 ? lower : lower + 1;
+  return Math.round(value);
+}
+
 function calculateSegmentResolution(aspectRatio, megapixels, multiple) {
   const ratio = H3S_ASPECT_RATIOS[aspectRatio] || H3S_ASPECT_RATIOS[H3S_DEFAULT_ASPECT];
   const mp = Math.round(Math.min(16, Math.max(0.1,
     Number(megapixels) || H3S_DEFAULT_MEGAPIXELS)) * 10) / 10;
   const mul = Math.min(128, Math.max(8, Math.round(Number(multiple) || H3S_DEFAULT_MULTIPLE)));
-  const pyRound = (value) => {
-    const lower = Math.floor(value);
-    const fraction = value - lower;
-    if (Math.abs(fraction - 0.5) < 1e-10) return lower % 2 === 0 ? lower : lower + 1;
-    return Math.round(value);
-  };
   const scale = Math.sqrt(mp * 1024 * 1024 / (ratio[0] * ratio[1]));
-  return [Math.max(mul, pyRound(ratio[0] * scale / mul) * mul),
-    Math.max(mul, pyRound(ratio[1] * scale / mul) * mul)];
+  return [Math.max(mul, pythonRound(ratio[0] * scale / mul) * mul),
+    Math.max(mul, pythonRound(ratio[1] * scale / mul) * mul)];
+}
+
+function calculateSecondPassResolution(sourceWidth, sourceHeight, megapixels) {
+  const width = Math.max(1, Math.round(Number(sourceWidth) || 1));
+  const height = Math.max(1, Math.round(Number(sourceHeight) || 1));
+  const mp = Math.min(16, Math.max(0.1, Number(megapixels) || 1.0));
+  const multiple = 32;
+  const scale = Math.sqrt(mp * 1024 * 1024 / (width * height));
+  return [Math.max(multiple, pythonRound(width * scale / multiple) * multiple),
+    Math.max(multiple, pythonRound(height * scale / multiple) * multiple)];
 }
 
 function defaultResolutionFields() {
@@ -219,6 +230,21 @@ function defaultResolutionFields() {
     multiple: H3S_DEFAULT_MULTIPLE,
     width,
     height,
+  };
+}
+
+function defaultSecondPassFields() {
+  return {
+    second_pass_enabled: false,
+    second_pass_megapixels: 1.0,
+    second_pass_steps: 4,
+    second_pass_denoise: 0.2,
+    second_pass_sampler: "euler",
+    second_pass_scheduler: "beta",
+    second_pass_resize_method: "bilinear",
+    second_pass_resize_device: "gpu",
+    second_pass_resize_batch_size: 8,
+    second_pass_open: false,
   };
 }
 
@@ -235,6 +261,7 @@ function defaultSegs() {
       seed: 916261814925780 + (i + 1) * 777,
       refs: [],
       ...defaultResolutionFields(),
+      ...defaultSecondPassFields(),
       duration: 10,
       inherit_shared: true,
       generation_mode: "multi_ref",
@@ -255,6 +282,7 @@ function defaultTextSegs() {
     seed: Math.floor(Math.random() * 1e15),
     refs: [],
     ...defaultResolutionFields(),
+    ...defaultSecondPassFields(),
     duration: 10,
     inherit_shared: true,
     use_tail: false,
@@ -1277,6 +1305,43 @@ function buildStudio(node) {
     normalizeChoice(secondPassMethodWidget, "bilinear");
     normalizeChoice(secondPassDeviceWidget, "gpu");
   };
+  const normalizeSegmentSecondPass = (seg) => {
+    if (!seg || typeof seg !== "object") return;
+    const fallback = defaultSecondPassFields();
+    // 旧工作流没有段级字段：只在首次升级时复制旧公共 widget 的当前值。
+    if (typeof seg.second_pass_enabled !== "boolean") {
+      seg.second_pass_enabled = !!(secondPassWidget && secondPassWidget.value);
+    }
+    const numberValue = (key, widget, min, max, integer = false) => {
+      const own = Number(seg[key]);
+      const legacy = Number(widget && widget.value);
+      let value = Number.isFinite(own) ? own
+        : Number.isFinite(legacy) ? legacy : fallback[key];
+      value = Math.min(max, Math.max(min, value));
+      seg[key] = integer ? Math.round(value) : value;
+    };
+    numberValue("second_pass_megapixels", secondPassMPWidget, 0.1, 16.0);
+    numberValue("second_pass_steps", secondPassStepsWidget, 1, 50, true);
+    numberValue("second_pass_denoise", secondPassDenoiseWidget, 0.01, 1.0);
+    numberValue("second_pass_resize_batch_size", secondPassBatchWidget, 1, 64, true);
+    const choiceValue = (key, widget, defaultValue) => {
+      const values = widget && widget.options && Array.isArray(widget.options.values)
+        ? widget.options.values : [];
+      const own = String(seg[key] ?? "");
+      const legacy = String(widget?.value ?? "");
+      seg[key] = values.includes(own) ? own
+        : values.includes(legacy) ? legacy
+        : values.includes(defaultValue) ? defaultValue : (values[0] || defaultValue);
+    };
+    choiceValue("second_pass_sampler", secondPassSamplerWidget, "euler");
+    choiceValue("second_pass_scheduler", secondPassSchedulerWidget, "beta");
+    choiceValue("second_pass_resize_method", secondPassMethodWidget, "bilinear");
+    choiceValue("second_pass_resize_device", secondPassDeviceWidget, "gpu");
+    if (seg.second_pass_resize_method === "nvidia_rtx_vsr") {
+      seg.second_pass_resize_device = "gpu";
+    }
+    seg.second_pass_open = seg.second_pass_open === true;
+  };
   const normalizeExportWidgets = () => {
     // 默认使用 ComfyUI/output；同时迁移 2.20.x 曾误写入的项目专用默认值。
     const oldDir = "E:\\短剧项目\\骗子\\片段\\第二场";
@@ -1453,7 +1518,11 @@ function buildStudio(node) {
     });
     row.append(label, input, mk("span", "h3s-hint", "0=不加载；本段保存 clip " + (Number(input.value) + 1)));
   };
-  const _modeQ = () => new URLSearchParams({ mode: curMode(), project_id: ensureProjectId() }).toString();
+  const _modeQ = () => new URLSearchParams({
+    mode: curMode(),
+    project_id: ensureProjectId(),
+    filename_prefix: String(filenamePrefixWidget?.value ?? "").trim() || "ComfyUI",
+  }).toString();
   const migrateTextRefs = () => {
     if (!Array.isArray(node.properties.h3_text_refs)) node.properties.h3_text_refs = [];
     const refLists = textSegs.map((seg) => Array.isArray(seg.refs) ? seg.refs.slice() : []);
@@ -1482,7 +1551,6 @@ function buildStudio(node) {
     }
   };
   let syncLowVramButton = () => {};
-  let syncSecondPassButton = () => {};
   const save = () => {
     normalizeSummaryWidget();
     normalizeMotionContextWidgets();
@@ -1493,6 +1561,9 @@ function buildStudio(node) {
     normalizeContinuityModes(createSegs);
     normalizeContinuityModes(videoSegs);
     normalizeContinuityModes(textSegs);
+    createSegs.forEach(normalizeSegmentSecondPass);
+    videoSegs.forEach(normalizeSegmentSecondPass);
+    textSegs.forEach(normalizeSegmentSecondPass);
     normalizeResolutionContinuity(createSegs);
     normalizeResolutionContinuity(videoSegs);
     normalizeResolutionContinuity(textSegs);
@@ -1502,7 +1573,6 @@ function buildStudio(node) {
     if (textSharedRefsWidget) textSharedRefsWidget.value = JSON.stringify(node.properties.h3_text_refs || []);
     if (modeWidget) modeWidget.value = curMode();
     syncLowVramButton();
-    syncSecondPassButton();
   };
   const appendResolutionControls = (row, seg) => {
     normalizeSegmentResolution(seg);
@@ -1880,52 +1950,30 @@ function buildStudio(node) {
     save();
   });
   syncLowVramButton();
-  const appendSecondPassButton = (row) => {
-    const button = mk("button", "h3s-btn", "二采放大");
-    button.title = "每段先完成一采和 Motion 裁剪，再放大、VAE重编码并执行低降噪二次采样。";
-    syncSecondPassButton = () => {
-      const enabled = !!(secondPassWidget && secondPassWidget.value);
-      button.textContent = enabled ? "☑ 二采放大" : "二采放大";
-      button.classList.toggle("primary", enabled);
-    };
-    button.addEventListener("click", () => {
-      if (!secondPassWidget) {
-        status.textContent = "二采放大需要新版后端，请完全重启 ComfyUI 再 Ctrl+F5";
-        status.style.color = "#ff8080";
-        return;
-      }
-      secondPassWidget.value = !secondPassWidget.value;
-      status.textContent = secondPassWidget.value
-        ? "二采放大已开启：默认 1.0MP、4步 beta、0.2降噪"
-        : "二采放大已关闭";
-      status.style.color = secondPassWidget.value ? "#8ee6a0" : "";
-      save();
-      renderEditor();
-    });
-    syncSecondPassButton();
-    row.appendChild(button);
-  };
-  const appendSecondPassSettings = (parent) => {
-    if (!(secondPassWidget && secondPassWidget.value)) return;
+  const appendSecondPassSettings = (parent, seg) => {
+    normalizeSegmentSecondPass(seg);
+    if (seg.second_pass_enabled !== true) {
+      parent.appendChild(mk("div", "h3s-hint", "勾选“启用二采放大”后显示采样参数。"));
+      return;
+    }
     const settings = mk("div", "h3s-row");
-    settings.style.cssText = "padding:5px 8px;border:1px solid #334b61;border-radius:7px;background:#17212b;";
-    settings.appendChild(mk("span", "h3s-hint", "二采设置"));
-    const addNumber = (label, widget, step, integer = false) => {
+    settings.style.cssText = "padding:7px 0 2px;";
+    const addNumber = (label, key, step, integer = false) => {
       settings.appendChild(mk("span", "h3s-hint", label));
       const input = mk("input", "h3s-durinput");
       input.type = "number";
       input.step = String(step);
-      input.value = String(widget ? widget.value : "");
+      input.value = String(seg[key]);
       input.addEventListener("change", () => {
-        if (!widget) return;
         const value = Number(input.value);
-        if (Number.isFinite(value)) widget.value = integer ? Math.round(value) : value;
+        if (Number.isFinite(value)) seg[key] = integer ? Math.round(value) : value;
         save();
-        input.value = String(widget.value);
+        input.value = String(seg[key]);
       });
       settings.appendChild(input);
+      return input;
     };
-    const addChoice = (label, widget) => {
+    const addChoice = (label, key, widget) => {
       settings.appendChild(mk("span", "h3s-hint", label));
       const select = mk("select", "h3s-seedmode");
       select.style.width = "112px";
@@ -1937,27 +1985,89 @@ function buildStudio(node) {
         option.textContent = value;
         select.appendChild(option);
       }
-      select.value = widget ? widget.value : "";
+      select.value = seg[key];
       select.addEventListener("change", () => {
-        if (widget) widget.value = select.value;
-        if (widget === secondPassMethodWidget && select.value === "nvidia_rtx_vsr"
-          && secondPassDeviceWidget) {
-          secondPassDeviceWidget.value = "gpu";
+        seg[key] = select.value;
+        if (key === "second_pass_resize_method" && select.value === "nvidia_rtx_vsr") {
+          seg.second_pass_resize_device = "gpu";
         }
         save();
-        if (widget === secondPassMethodWidget) renderEditor();
+        if (key === "second_pass_resize_method") renderEditor();
       });
       settings.appendChild(select);
     };
-    addNumber("MP", secondPassMPWidget, 0.1);
-    addNumber("步数", secondPassStepsWidget, 1, true);
-    addNumber("降噪", secondPassDenoiseWidget, 0.01);
-    addChoice("采样器", secondPassSamplerWidget);
-    addChoice("调度", secondPassSchedulerWidget);
-    addChoice("缩放", secondPassMethodWidget);
-    addChoice("设备", secondPassDeviceWidget);
-    addNumber("批", secondPassBatchWidget, 1, true);
+    const megapixelsInput = addNumber("MP", "second_pass_megapixels", 0.1);
+    const outputSize = mk("span", "h3s-hint");
+    outputSize.style.cssText = "color:#9fd0ff;opacity:.95;white-space:nowrap;";
+    const refreshOutputSize = () => {
+      const previewMP = Number(megapixelsInput.value);
+      const value = Number.isFinite(previewMP) ? previewMP : seg.second_pass_megapixels;
+      const [outputWidth, outputHeight] = calculateSecondPassResolution(
+        seg.width, seg.height, value);
+      const aspect = String(seg.aspect_ratio || "").split(" ")[0] || `${seg.width}:${seg.height}`;
+      outputSize.textContent = `→ ${outputWidth}×${outputHeight}（${aspect}）`;
+      outputSize.title = `当前片段 ${seg.width}×${seg.height} 按 ${value}MP 二采后的实际输出尺寸`;
+    };
+    megapixelsInput.addEventListener("input", refreshOutputSize);
+    megapixelsInput.addEventListener("change", refreshOutputSize);
+    refreshOutputSize();
+    settings.appendChild(outputSize);
+    addNumber("步数", "second_pass_steps", 1, true);
+    addNumber("降噪", "second_pass_denoise", 0.01);
+    addChoice("采样器", "second_pass_sampler", secondPassSamplerWidget);
+    addChoice("调度", "second_pass_scheduler", secondPassSchedulerWidget);
+    addChoice("缩放", "second_pass_resize_method", secondPassMethodWidget);
+    addChoice("设备", "second_pass_resize_device", secondPassDeviceWidget);
+    addNumber("批", "second_pass_resize_batch_size", 1, true);
     parent.appendChild(settings);
+  };
+  const appendSecondPassSection = (parent, seg) => {
+    normalizeSegmentSecondPass(seg);
+    const wrap = document.createElement("details");
+    wrap.className = "h3s-slrow";
+    wrap.style.cssText = "display:block;margin-top:2px;min-width:260px;overflow:visible;";
+    wrap.open = seg.second_pass_open === true;
+    wrap.addEventListener("toggle", () => {
+      seg.second_pass_open = wrap.open;
+      save();
+      autoFitCompactPanel();
+    });
+
+    const title = document.createElement("summary");
+    title.className = "h3s-hint";
+    title.style.cssText = "cursor:pointer;color:#9fd0ff;user-select:none;";
+    title.textContent = "段级二采放大（" + (seg.second_pass_enabled ? "已开启" : "未开启") + "）";
+    title.title = "每段先完成一采和 Motion 裁剪，再放大、VAE 重编码并执行低降噪二次采样。";
+    wrap.appendChild(title);
+
+    const body = mk("div", null);
+    body.style.cssText = "display:flex;flex-direction:column;gap:5px;padding:7px 0 2px;";
+    const enableRow = mk("label", "h3s-row");
+    enableRow.style.cursor = "pointer";
+    const enabled = document.createElement("input");
+    enabled.type = "checkbox";
+    enabled.checked = seg.second_pass_enabled === true;
+    enabled.addEventListener("change", () => {
+      if (!secondPassWidget) {
+        status.textContent = "二采放大需要新版后端，请完全重启 ComfyUI 再 Ctrl+F5";
+        status.style.color = "#ff8080";
+        enabled.checked = false;
+        return;
+      }
+      seg.second_pass_enabled = enabled.checked;
+      seg.second_pass_open = true;
+      status.textContent = enabled.checked
+        ? "当前片段二采放大已开启"
+        : "当前片段二采放大已关闭";
+      status.style.color = enabled.checked ? "#8ee6a0" : "";
+      save();
+      renderEditor();
+    });
+    enableRow.append(enabled, mk("span", null, "启用二采放大"));
+    body.appendChild(enableRow);
+    appendSecondPassSettings(body, seg);
+    wrap.appendChild(body);
+    parent.appendChild(wrap);
   };
   const btnPreviewToggle = mk("button", "h3s-btn", "隐藏播放器");
   const syncPreviewToggle = () => {
@@ -3032,10 +3142,9 @@ function buildStudio(node) {
     row0.appendChild(motionLab);
     if (continuityBlocked) row0.appendChild(mk("span", "h3s-audio-warn", "尾帧续接已禁用；勾选 MotionContext 会自动同步上段尺寸和帧率"));
     appendLocalMotionIndex(row0, s, sel);
-    appendSecondPassButton(row0);
     row0.appendChild(mk("span", "h3s-hint", "每段=上方照片+下方参考视频，建议时长 ≤ 参考视频时长"));
     editor.appendChild(row0);
-    appendSecondPassSettings(editor);
+    appendSecondPassSection(editor, s);
 
     /* ======== ① 视频和图片 ======== */
     editor.appendChild(mk("div", "h3s-hint", "视频和图片（拖入或点选；图片=外观参考，视频自动归入下方参考视频区）："));
@@ -3419,6 +3528,7 @@ function buildStudio(node) {
           seed: Math.floor(Math.random() * 1e15),
           refs: [],
           ...defaultResolutionFields(),
+          ...defaultSecondPassFields(),
           duration: p.duration > 0 ? p.duration : clampDur(_defDur),
           inherit_shared: true,
           use_tail: false,
@@ -3498,6 +3608,7 @@ function buildStudio(node) {
         seed: Math.floor(Math.random() * 1e15),
         refs: [],
         ...defaultResolutionFields(),
+        ...defaultSecondPassFields(),
         duration: p.duration > 0 ? p.duration : clampDur(_defDur),
         inherit_shared: true,
         use_tail: false,
@@ -3808,9 +3919,8 @@ function buildStudio(node) {
     row0.appendChild(motionLab);
     if (continuityBlocked) row0.appendChild(mk("span", "h3s-audio-warn", "尾帧续接已禁用；勾选 MotionContext 会自动同步上段尺寸和帧率"));
     appendLocalMotionIndex(row0, s, sel);
-    appendSecondPassButton(row0);
     editor.appendChild(row0);
-    appendSecondPassSettings(editor);
+    appendSecondPassSection(editor, s);
 
     /* ======== ② 本段提示词 ======== */
     const prRow = mk("div", "h3s-row");
@@ -4549,7 +4659,6 @@ function buildStudio(node) {
 
     // Motion Context 的来源：默认保持原有“本地自动 latent”逻辑；云平台不能写 latent
     // 时可改为上传此前保存的 latent，或直接上传上一段带音轨的视频。
-    let secondPassButtonPlaced = false;
     if (s.motion_context === true) {
       const sourceRow = mk("div", "h3s-row");
       sourceRow.appendChild(mk("span", "h3s-hint", "Motion Context 来源："));
@@ -4598,8 +4707,6 @@ function buildStudio(node) {
           save(); renderEditor();
         });
         sourceRow.append(indexLabel, indexIn);
-        appendSecondPassButton(sourceRow);
-        secondPassButtonPlaced = true;
         sourceRow.appendChild(mk("span", "h3s-hint",
           motionContextSource === "aliyun_oss"
             ? "0=不加载；生成后保存 object_key/clip_" + String(Number(indexIn.value) + 1).padStart(5, "0") + ".safetensors"
@@ -4645,10 +4752,6 @@ function buildStudio(node) {
           sourceRow.appendChild(rmLatent);
         }
       }
-      if (!secondPassButtonPlaced) {
-        appendSecondPassButton(sourceRow);
-        secondPassButtonPlaced = true;
-      }
       sourceRow.appendChild(mk("span", "h3s-hint", motionContextSource === "video"
         ? "视频上传区在本段音频下方"
         : motionContextSource === "local_latent" ? "沿用原有本地 clip 自动续接"
@@ -4656,12 +4759,7 @@ function buildStudio(node) {
         : "运行时校验 AV latent 格式"));
       editor.appendChild(sourceRow);
     }
-    if (!secondPassButtonPlaced) {
-      const secondPassRow = mk("div", "h3s-row");
-      appendSecondPassButton(secondPassRow);
-      editor.appendChild(secondPassRow);
-    }
-    appendSecondPassSettings(editor);
+    appendSecondPassSection(editor, s);
 
     /* 段级生成模式：端点模式直接映射到原生 MiniMaxH3ImageToVideo。
        参考图区前两张图的顺序固定为首帧、尾帧，避免依赖提示词猜测。 */
