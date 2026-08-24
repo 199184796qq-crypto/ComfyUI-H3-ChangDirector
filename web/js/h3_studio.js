@@ -4,7 +4,7 @@ import { H3_TEXT_TEMPLATES } from "./h3_templates.js";
 
 /* 前端版本号：与 routes.py 的 BACKEND_VERSION 对应。
    status 接口返回的后端版本若与此不一致（用户改了代码但没重启/没强刷），状态栏红字提示。 */
-const H3S_VERSION = "2.27.5";
+const H3S_VERSION = "2.27.6";
 const activeProjectIds = new Map();
 
 function newProjectId() {
@@ -1964,12 +1964,16 @@ function buildStudio(node) {
       input.type = "number";
       input.step = String(step);
       input.value = String(seg[key]);
-      input.addEventListener("change", () => {
+      const persistValue = (rewriteInput) => {
+        if (!String(input.value).trim()) return;
         const value = Number(input.value);
         if (Number.isFinite(value)) seg[key] = integer ? Math.round(value) : value;
         save();
-        input.value = String(seg[key]);
-      });
+        if (rewriteInput) input.value = String(seg[key]);
+      };
+      // 输入时立即落到当前片段，避免尚未失焦就切换片段导致参数丢失。
+      input.addEventListener("input", () => persistValue(false));
+      input.addEventListener("change", () => persistValue(true));
       settings.appendChild(input);
       return input;
     };
@@ -2300,6 +2304,7 @@ function buildStudio(node) {
       refs: [],
       video_refs: [],
       ...defaultResolutionFields(),
+      ...defaultSecondPassFields(),
       duration: _defDur,
       inherit_shared: true,
       use_tail: false,

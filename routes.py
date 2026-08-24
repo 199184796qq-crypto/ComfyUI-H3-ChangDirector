@@ -26,7 +26,7 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, web
 OUTPUT_DIR = folder_paths.get_output_directory()
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 PROJECT_ROOT = os.path.join(VIDEO_DIR, "h3director")
-BACKEND_VERSION = "2.27.5"  # 前端 JS 据此判断后端代码是否过旧（提示用户重启 ComfyUI）
+BACKEND_VERSION = "2.27.6"  # 前端 JS 据此判断后端代码是否过旧（提示用户重启 ComfyUI）
 MAX_AUDIO_UPLOAD = 100 * 1024 * 1024
 MAX_VIDEO_UPLOAD = 2 * 1024 * 1024 * 1024
 MAX_CONTEXT_VIDEO_UPLOAD = 200 * 1024 * 1024
