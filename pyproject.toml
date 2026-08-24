@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-h3-contextdirector"
 description = "MiniMax H3 长序列分镜融合台：多段长视频时间轴、参考素材、段级音频、缓存重跑与尾帧接力"
-version = "2.21.4"
+version = "2.27.1"
 license = { text = "MIT" }
 dependencies = ["imageio-ffmpeg", "opencv-python"]
 

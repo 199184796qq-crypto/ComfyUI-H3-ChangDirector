@@ -23,11 +23,13 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import numpy as np
 import requests
 import torch
+import torchaudio
 from PIL import Image
 from safetensors.torch import load as safetensors_load, save as safetensors_save
 
 import folder_paths
 import comfy.samplers
+import comfy.nested_tensor
 import comfy.utils
 import comfy.model_management
 import latent_preview
@@ -45,7 +47,7 @@ INPUT_DIR = folder_paths.get_input_directory()
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 PROJECT_ROOT = os.path.join(VIDEO_DIR, "h3director")
 FPS = 24
-CACHE_SCHEMA = 12  # v2.26.0：段级 Add Guide 时间锚点
+CACHE_SCHEMA = 12  # 二采关闭时继续命中既有缓存；开启时由独立配置键失效
 
 # 段级生成模式。multi_ref 保持旧版 Ref2VA 多参考图行为；其余模式走
 # MiniMaxH3ImageToVideo，并由本段 refs 的顺序提供首帧/尾帧。
@@ -63,6 +65,9 @@ SEGMENT_ASPECT_RATIOS = {
     "16:9 (Widescreen)": (16, 9),
     "21:9 (Ultrawide)": (21, 9),
 }
+
+SECOND_PASS_UPSCALE_METHODS = (
+    "nearest-exact", "bilinear", "area", "bicubic", "lanczos", "nvidia_rtx_vsr")
 
 
 def _segment_resolution(seg_cfg, default_width, default_height):
@@ -639,6 +644,196 @@ def _conditioning_after_motion_trim(base_conditioning, motion_conditioning,
         meta["minimax_frame_count"] = visible_frames
         out.append([embedding, meta])
     return out
+
+
+def _second_pass_resolution(source_width, source_height, megapixels, multiple=32):
+    """Scale a source canvas to a target pixel area without changing its aspect ratio."""
+    source_width = max(1, int(source_width))
+    source_height = max(1, int(source_height))
+    multiple = max(8, int(multiple))
+    try:
+        megapixels = float(megapixels)
+    except (TypeError, ValueError):
+        megapixels = 1.0
+    target_pixels = max(0.1, min(16.0, megapixels)) * 1024 * 1024
+    scale = math.sqrt(target_pixels / (source_width * source_height))
+    width = max(multiple, round(source_width * scale / multiple) * multiple)
+    height = max(multiple, round(source_height * scale / multiple) * multiple)
+    return width, height
+
+
+def _resize_frames_chunked(images, width, height, method="bilinear",
+                           device="gpu", batch_size=8):
+    """Resize an IMAGE batch in bounded chunks and keep the result in CPU RAM."""
+    if method not in SECOND_PASS_UPSCALE_METHODS:
+        method = "bilinear"
+    if method == "nvidia_rtx_vsr":
+        try:
+            import nvvfx
+        except ImportError as exc:
+            raise ImportError(
+                "[H3导演台] nvidia_rtx_vsr 需要 nvidia-vfx 和兼容的 NVIDIA RTX GPU。"
+            ) from exc
+        context = nvvfx.VideoSuperRes(nvvfx.effects.QualityLevel.ULTRA)
+        video_sr = context.__enter__()
+        try:
+            video_sr.output_width = max(8, round(int(width) / 8) * 8)
+            video_sr.output_height = max(8, round(int(height) / 8) * 8)
+            if hasattr(video_sr, "load"):
+                video_sr.load()
+            frames_chw = images[..., :3].movedim(-1, 1).cuda().contiguous()
+            parts = []
+            total = int(frames_chw.shape[0])
+            pbar = comfy.utils.ProgressBar(max(1, total))
+            for index in range(total):
+                result = video_sr.run(frames_chw[index]).image
+                parts.append(torch.from_dlpack(result).clone().cpu())
+                pbar.update_absolute(index + 1)
+            return torch.stack(parts, dim=0).movedim(1, -1).float()
+        finally:
+            context.__exit__(None, None, None)
+    batch_size = max(1, int(batch_size))
+    target_device = (comfy.model_management.get_torch_device()
+                     if str(device).lower() == "gpu" else torch.device("cpu"))
+    parts = []
+    total = int(images.shape[0])
+    pbar = comfy.utils.ProgressBar(max(1, total))
+    for start in range(0, total, batch_size):
+        batch = images[start:start + batch_size, ..., :3].movedim(-1, 1).to(target_device)
+        resized = comfy.utils.common_upscale(
+            batch, int(width), int(height), method, "center")
+        parts.append(resized.movedim(1, -1).float().cpu())
+        pbar.update_absolute(min(total, start + batch.shape[0]))
+        del batch, resized
+    return torch.cat(parts, dim=0)
+
+
+def _encode_second_pass_audio(audio_vae, audio, frame_count):
+    """Encode the delivered (post-Motion-trim) soundtrack for the refine AV latent."""
+    sample_rate = int(audio["sample_rate"])
+    vae_sample_rate = int(getattr(audio_vae, "audio_sample_rate", 44100))
+    waveform = audio["waveform"]
+    if sample_rate != vae_sample_rate:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, vae_sample_rate)
+    latent = audio_vae.encode(waveform.movedim(1, -1))
+
+    # H3 couples pixel frames at 24 fps to audio latent frames at 40 fps.
+    # VAE rounding can differ by one frame, so make the relationship explicit.
+    target_t = max(1, round(int(frame_count) / FPS * 40))
+    if latent.shape[-1] > target_t:
+        latent = latent[..., :target_t].clone()
+    elif latent.shape[-1] < target_t:
+        latent = torch.nn.functional.pad(latent, (0, target_t - latent.shape[-1]))
+    return latent
+
+
+def _resize_second_pass_conditioning(conditioning, vae, width, height,
+                                     frame_count, method="bilinear"):
+    """Re-encode H3 keyframe/Guide anchors for the refine canvas.
+
+    Ref2VA reference blocks keep their own independent canvas and therefore
+    must not be resized. Keyframes, however, are injected into the generated
+    canvas and have to match its spatial token grid.
+    """
+    if method not in SECOND_PASS_UPSCALE_METHODS:
+        method = "bilinear"
+    latent_cache = {}
+    out = []
+    for embedding, metadata in conditioning:
+        meta = dict(metadata)
+        resized_keyframes = []
+        for keyframe in metadata.get("minimax_keyframes") or []:
+            copied = dict(keyframe)
+            keyframe_latent = copied.get("latent")
+            if isinstance(keyframe_latent, torch.Tensor):
+                cache_key = id(keyframe_latent)
+                replacement = latent_cache.get(cache_key)
+                if replacement is None:
+                    with torch.inference_mode():
+                        pixels = vae.decode(keyframe_latent)
+                        if pixels.dim() == 5:
+                            pixels = pixels[0]
+                        pixels = _resize_frames_chunked(
+                            pixels.float().clamp(0, 1).cpu(), width, height,
+                            method=method, device="cpu", batch_size=8)
+                        replacement = vae.encode(pixels)
+                    latent_cache[cache_key] = replacement
+                copied["latent"] = replacement
+            copied["resolved_frame_index"] = max(
+                0, min(int(frame_count) - 1,
+                       int(copied.get("resolved_frame_index", 0))))
+            resized_keyframes.append(copied)
+        if resized_keyframes:
+            meta["minimax_keyframes"] = resized_keyframes
+        else:
+            meta.pop("minimax_keyframes", None)
+        meta["minimax_frame_count"] = int(frame_count)
+        out.append([embedding, meta])
+    return out
+
+
+def _second_pass_sigmas(model, scheduler, steps, denoise):
+    """Match ComfyUI BasicScheduler's partial-denoise schedule."""
+    steps = max(1, int(steps))
+    denoise = max(0.01, min(1.0, float(denoise)))
+    total_steps = max(steps, int(steps / denoise))
+    sigmas = comfy.samplers.calculate_sigmas(
+        model.get_model_object("model_sampling"), scheduler, total_steps).cpu()
+    return sigmas[-(steps + 1):]
+
+
+def _run_second_pass(frames, audio, conditioning, video_vae, audio_vae,
+                     refine_model, schedule_model, seed, megapixels=1.0,
+                     steps=4, denoise=0.2, sampler_name="euler",
+                     scheduler="beta", resize_method="bilinear",
+                     resize_device="gpu", resize_batch_size=8):
+    """Pixel upscale, VAE re-encode and low-denoise H3 refine sampling."""
+    source_height, source_width = int(frames.shape[1]), int(frames.shape[2])
+    width, height = _second_pass_resolution(
+        source_width, source_height, megapixels, multiple=32)
+    _log("[H3导演台] 二采放大：%dx%d -> %dx%d，%d步 %s/%s，降噪 %.2f" % (
+        source_width, source_height, width, height, int(steps),
+        sampler_name, scheduler, float(denoise)))
+
+    upscaled = _resize_frames_chunked(
+        frames, width, height, method=resize_method,
+        device=resize_device, batch_size=resize_batch_size)
+    frame_count = int(upscaled.shape[0])
+    with torch.inference_mode():
+        video_latent = video_vae.encode(upscaled)
+        audio_latent = _encode_second_pass_audio(audio_vae, audio, frame_count)
+        refine_conditioning = _resize_second_pass_conditioning(
+            conditioning, video_vae, width, height, frame_count,
+            method=resize_method)
+
+    latent = {"samples": comfy.nested_tensor.NestedTensor((video_latent, audio_latent))}
+    sigmas = _second_pass_sigmas(schedule_model, scheduler, steps, denoise)
+    sampler = comfy.samplers.sampler_object(sampler_name)
+    guider = Guider_Basic(refine_model)
+    guider.set_conds(refine_conditioning)
+    noise = Noise_RandomNoise(int(seed))
+    x0_output = {}
+    callback = latent_preview.prepare_callback(
+        guider.model_patcher, sigmas.shape[-1] - 1, x0_output)
+    latent_image = comfy.sample.fix_empty_latent_channels(
+        guider.model_patcher, latent["samples"], None, None)
+    samples = guider.sample(
+        noise.generate_noise(latent), latent_image, sampler, sigmas,
+        callback=callback,
+        disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+        seed=noise.seed)
+    samples = samples.to(comfy.model_management.intermediate_device())
+
+    with torch.inference_mode():
+        video_result = samples.unbind()[0] if getattr(samples, "is_nested", False) else samples
+        refined_frames = video_vae.decode(video_result)
+    refined_frames = refined_frames.float().clamp(0, 1).cpu()
+    if refined_frames.dim() == 5:
+        refined_frames = refined_frames[0]
+    del upscaled, video_latent, audio_latent, latent_image
+    del sigmas, sampler, guider, callback, x0_output, video_result
+    return (refined_frames, {"samples": samples}, refine_conditioning,
+            noise, (width, height))
 
 
 def _context_directory(value):
@@ -1344,6 +1539,22 @@ class H3DirectorStudio:
                 "外部文本目标段": ("INT", {
                     "default": 1, "min": 1, "max": 9999, "step": 1,
                     "tooltip": "由导演台界面自动同步当前选中段，用于把外部文本送入正确的段。"}),
+                # 二采字段继续只追加在末尾，确保旧工作流的 widgets_values 顺序不变。
+                "二采放大": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "开启后，每段在 Motion 裁剪后执行：解码、像素放大、VAE重编码、低降噪二次采样。"}),
+                "二采百万像素": ("FLOAT", {
+                    "default": 1.0, "min": 0.1, "max": 16.0, "step": 0.1}),
+                "二采步数": ("INT", {"default": 4, "min": 1, "max": 50, "step": 1}),
+                "二采降噪": ("FLOAT", {
+                    "default": 0.2, "min": 0.01, "max": 1.0, "step": 0.01}),
+                "二采采样器": (comfy.samplers.SAMPLER_NAMES, {"default": "euler"}),
+                "二采调度器": (comfy.samplers.SCHEDULER_NAMES, {"default": "beta"}),
+                "二采缩放方法": (SECOND_PASS_UPSCALE_METHODS, {"default": "bilinear"}),
+                "二采缩放设备": (["gpu", "cpu"], {"default": "gpu"}),
+                "二采缩放批大小": ("INT", {
+                    "default": 8, "min": 1, "max": 64, "step": 1,
+                    "tooltip": "仅控制逐帧像素缩放的批大小；VAE仍按完整时间序列编码。"}),
             },
             "optional": {
                 "fl2va_model": ("MODEL",),
@@ -1357,6 +1568,9 @@ class H3DirectorStudio:
                                "断开后恢复使用文本框原内容。"}),
                 "阿里云OSS配置": ("ALIYUN_OSS_CONFIG", {
                     "tooltip": "选择‘latent 延续：阿里云’时，连接‘阿里云 OSS 配置（REST）’节点。"}),
+                # 新插口也只追加到旧 optional 插口之后，避免既有连线槽位变化。
+                "二采模型": ("MODEL", {
+                    "tooltip": "可选的二采 H3 模型。建议连接工作流原有的 FL2VA 二采模型；不连接则复用本段一采模型。"}),
             },
             "hidden": {
                 "h3_prompt_graph": "PROMPT",
@@ -1380,7 +1594,12 @@ class H3DirectorStudio:
                       context_load_dir="h3_context", context_length="22",
                       audio_context_length=24, context_match_tail=True,
                       external_sigmas=None, save_context_latent=True,
-                      return_internal_outputs=False, oss_config=None):
+                      return_internal_outputs=False, oss_config=None,
+                      second_pass_enabled=False, second_pass_model=None,
+                      second_pass_megapixels=1.0, second_pass_steps=4,
+                      second_pass_denoise=0.2, second_pass_sampler="euler",
+                      second_pass_scheduler="beta", second_pass_resize_method="bilinear",
+                      second_pass_resize_device="gpu", second_pass_resize_batch_size=8):
         # 0) 计算本段时长与帧数（缺失时用节点默认时长），帧数对齐 ≡5 (mod 17)
         # 段级分辨率覆盖（v2.8）：每段视频尺寸可不同；留空=跟随节点宽高
         _wo = int(seg_cfg.get("width") or 0)
@@ -1784,18 +2003,9 @@ class H3DirectorStudio:
             noise.generate_noise(latent), latent_image, sampler, sigmas,
             callback=callback, disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=noise.seed)
         samples = samples.to(comfy.model_management.intermediate_device())
-        output_latent = {"samples": samples} if return_internal_outputs else None
+        output_latent = None
         output_positive = None
-        if return_internal_outputs:
-            output_positive = _conditioning_after_motion_trim(
-                base_conditioning, motion_conditioning, cond,
-                trim_frames=trim_frames, total_frames=length)
-            if trim_frames > 0:
-                _log("[H3导演台] 段%d positive 已切换为裁剪后时间轴：%d -> %d 帧" % (
-                    seg_idx, length, max(1, length - trim_frames)))
-            else:
-                _log("[H3导演台] 段%d positive 保持原始条件（未实际应用 Motion 裁剪）" % seg_idx)
-        output_noise = noise if return_internal_outputs else None
+        output_noise = None
 
         # 无论 MotionContext 段级开关是否开启，每个已生成段都保存 H3 AV latent。
         # clip_index 使用真实段号；重跑同一段只覆盖自己的主存储固定槽位。
@@ -1830,17 +2040,78 @@ class H3DirectorStudio:
             "waveform": audio["waveform"].detach().float().cpu(),
             "sample_rate": int(audio["sample_rate"]),
         }
-        if motion_enabled and trim_frames > 0:
+        # 成片是否裁掉接力头，只看本段 MotionContext 是否实际生效及其
+        # apply 返回的 trim_frames。index=0 没有加载旧上下文，因此即使
+        # 开关已勾选也不会误裁；关闭 MotionContext 时绝不沿用陈旧值。
+        output_trim_frames = max(0, int(trim_frames)) if motion_enabled else 0
+        if output_trim_frames > 0:
             frames, audio = _motion_context_trim(
-                TrimClass, frames, trim_frames, audio=audio, fps=float(FPS),
+                TrimClass, frames, output_trim_frames, audio=audio, fps=float(FPS),
                 match_tail=bool(context_match_tail))
             _log("[H3导演台] 段%d MotionContext 已裁掉开头 %d 帧，并同步处理音频" % (
-                seg_idx, trim_frames))
+                seg_idx, output_trim_frames))
+        elif motion_enabled:
+            _log("[H3导演台] 段%d MotionContext 未加载可用前缀：成片不裁剪开头帧" % seg_idx)
         audio_samples = int(audio["waveform"].shape[-1])
+
+        # 二采和外部输出都必须以 Motion 裁剪后的可见时间轴为准。用于下一段
+        # Motion 续接的 latent 已在上面保存，绝不被二采结果覆盖。
+        visible_conditioning = None
+        if second_pass_enabled or return_internal_outputs:
+            visible_conditioning = _conditioning_after_motion_trim(
+                base_conditioning, motion_conditioning, cond,
+                trim_frames=output_trim_frames, total_frames=length)
+            if output_trim_frames > 0:
+                _log("[H3导演台] 段%d positive 已切换为裁剪后时间轴：%d -> %d 帧" % (
+                    seg_idx, length, int(frames.shape[0])))
+            else:
+                _log("[H3导演台] 段%d positive 保持原始条件（未实际应用 Motion 裁剪）" % seg_idx)
+
+        if second_pass_enabled:
+            # 一采模型负责生成二采 sigma，Guider 优先使用独立二采模型，
+            # 与用户原工作流的 BasicScheduler / BasicGuider 分工一致。
+            refine_model = second_pass_model if second_pass_model is not None else sample_model
+            # Motion latent 已保存、可见帧与条件也已取得；在加载独立二采模型前
+            # 释放一采的巨型 latent/guider，避免两套 H3 状态同时占用显存。
+            samples = video_lat = latent_image = cond = latent = None
+            base_conditioning = motion_conditioning = None
+            guider = callback = x0_output = noise = sigmas = sampler = None
+            gc.collect()
+            comfy.model_management.soft_empty_cache()
+            comfy.model_management.cleanup_models()
+            refined_frames, refined_latent, refined_conditioning, refined_noise, _ = _run_second_pass(
+                frames, audio, visible_conditioning, vae, audio_vae,
+                refine_model, sample_model, int(seg_cfg.get("seed", 0)),
+                megapixels=second_pass_megapixels,
+                steps=second_pass_steps,
+                denoise=second_pass_denoise,
+                sampler_name=second_pass_sampler,
+                scheduler=second_pass_scheduler,
+                resize_method=second_pass_resize_method,
+                resize_device=second_pass_resize_device,
+                resize_batch_size=second_pass_resize_batch_size)
+            del frames
+            frames = refined_frames
+            if return_internal_outputs:
+                output_latent = refined_latent
+                output_positive = refined_conditioning
+                output_noise = refined_noise
+            else:
+                del refined_latent, refined_conditioning, refined_noise
+            _log("[H3导演台] 段%d 二采放大完成：成片 %dx%d" % (
+                seg_idx, int(frames.shape[2]), int(frames.shape[1])))
+        elif return_internal_outputs:
+            # 未启用二采时保持历史接口：latent 仍是包含 Motion 前缀的一采
+            # latent，而 positive 是已裁剪的可见时间轴条件。
+            output_latent = {"samples": samples}
+            output_positive = visible_conditioning
+            output_noise = noise
 
         # 采样和 VAE 解码已经结束：先释放 GPU 相关对象，再做 numpy 转换和 FFmpeg 编码。
         # 这样不会让近 20GB 的模型搬运状态与整段 RGB 帧在内存里长时间重叠。
         del samples, video_lat, latent_image, cond, latent, base_conditioning, motion_conditioning
+        if visible_conditioning is not None and visible_conditioning is not output_positive:
+            del visible_conditioning
         del guider, callback, x0_output, noise, sigmas, sampler
         gc.collect()
         comfy.model_management.soft_empty_cache()
@@ -1893,7 +2164,10 @@ class H3DirectorStudio:
                汇总输出="仅预览帧(推荐)", project_id="", text_shared_refs_json="[]",
                output_dir="output", filename_prefix="ComfyUI",
                外部文本目标段=1,
-               fl2va_model=None, 外部SIGMAS=None, 外部文本=None, 阿里云OSS配置=None,
+               二采放大=False, 二采百万像素=1.0, 二采步数=4, 二采降噪=0.2,
+               二采采样器="euler", 二采调度器="beta", 二采缩放方法="bilinear",
+               二采缩放设备="gpu", 二采缩放批大小=8,
+               fl2va_model=None, 二采模型=None, 外部SIGMAS=None, 外部文本=None, 阿里云OSS配置=None,
                h3_prompt_graph=None, h3_unique_id=None):
         # v2.3: two independent workspaces; ui_mode selects the dataset,
         # outputs use per-mode file names so the two never overwrite each other.
@@ -1916,6 +2190,22 @@ class H3DirectorStudio:
         external_text_target = max(1, min(len(segments), int(外部文本目标段 or 1)))
         if 外部文本 is not None:
             segments[external_text_target - 1]["prompt"] = str(外部文本)
+
+        second_pass_enabled = bool(二采放大)
+        second_pass_megapixels = max(0.1, min(16.0, float(二采百万像素 or 1.0)))
+        second_pass_steps = max(1, min(50, int(二采步数 or 4)))
+        second_pass_denoise = max(0.01, min(1.0, float(二采降噪 or 0.2)))
+        second_pass_sampler = (str(二采采样器) if str(二采采样器) in comfy.samplers.SAMPLER_NAMES
+                               else "euler")
+        second_pass_scheduler = (str(二采调度器) if str(二采调度器) in comfy.samplers.SCHEDULER_NAMES
+                                 else "beta")
+        second_pass_resize_method = (str(二采缩放方法)
+                                     if str(二采缩放方法) in SECOND_PASS_UPSCALE_METHODS
+                                     else "bilinear")
+        second_pass_resize_device = "cpu" if str(二采缩放设备).lower() == "cpu" else "gpu"
+        if second_pass_resize_method == "nvidia_rtx_vsr":
+            second_pass_resize_device = "gpu"
+        second_pass_resize_batch_size = max(1, min(64, int(二采缩放批大小 or 8)))
 
         # 所有界面和生成方式都允许两种续接方式。它们只彼此互斥，
         # 且均可关闭；不再因段号或生成方式被后台强制改写。
@@ -2047,6 +2337,7 @@ class H3DirectorStudio:
         tail_mode = "fl2v" if (fl2va_model is not None or primary_model_kind == "fl2va") else "ref2v"
         ref_model_sig = _upstream_fingerprint(h3_prompt_graph, h3_unique_id, "model")
         fl_model_sig = _upstream_fingerprint(h3_prompt_graph, h3_unique_id, "fl2va_model")
+        second_pass_model_sig = _upstream_fingerprint(h3_prompt_graph, h3_unique_id, "二采模型")
         external_sigmas_sig = _sigmas_signature(外部SIGMAS)
         report = ["H3 导演台运行报告", "段数 %d | %sx%s | 默认 %.1f 秒/段（每段可用 duration 覆盖）| %d steps %s/%s"
                   % (len(segments), width, height, 时长秒, steps, sampler, scheduler)]
@@ -2069,6 +2360,14 @@ class H3DirectorStudio:
             MotionContext画面帧数, int(MotionContext音频帧数)))
         report.append("成片导出 | 目录 %s | 命名 %s_片段号(4位)_视频短边_年月日_时_分.mp4" % (
             _resolve_export_directory(output_dir), filename_prefix))
+        if second_pass_enabled:
+            report.append("二采放大：开启 | %.1fMP | %d步 %s/%s | 降噪 %.2f | %s/%s | 模型 %s" % (
+                second_pass_megapixels, second_pass_steps, second_pass_sampler,
+                second_pass_scheduler, second_pass_denoise,
+                second_pass_resize_method, second_pass_resize_device,
+                "独立二采模型" if 二采模型 is not None else "复用本段一采模型"))
+        else:
+            report.append("二采放大：关闭")
         if 外部文本 is not None:
             report.append("外部文本：已连接并覆盖段%d提示词" % external_text_target)
         if low_vram_mode:
@@ -2167,6 +2466,18 @@ class H3DirectorStudio:
                           and _context_slot_path(上下文加载目录, motion_local_index) else None)
                 ),
             }
+            if second_pass_enabled:
+                run_cfg["second_pass"] = {
+                    "model": second_pass_model_sig,
+                    "megapixels": second_pass_megapixels,
+                    "steps": second_pass_steps,
+                    "denoise": second_pass_denoise,
+                    "sampler": second_pass_sampler,
+                    "scheduler": second_pass_scheduler,
+                    "resize_method": second_pass_resize_method,
+                    "resize_device": second_pass_resize_device,
+                    "resize_batch_size": second_pass_resize_batch_size,
+                }
             h = _config_hash(run_cfg)
             meta_ok = False
             meta_data = {}
@@ -2211,7 +2522,17 @@ class H3DirectorStudio:
                     external_sigmas=外部SIGMAS,
                     save_context_latent=save_context_latent,
                     return_internal_outputs=return_internal_outputs,
-                    oss_config=oss_config)
+                    oss_config=oss_config,
+                    second_pass_enabled=second_pass_enabled,
+                    second_pass_model=二采模型,
+                    second_pass_megapixels=second_pass_megapixels,
+                    second_pass_steps=second_pass_steps,
+                    second_pass_denoise=second_pass_denoise,
+                    second_pass_sampler=second_pass_sampler,
+                    second_pass_scheduler=second_pass_scheduler,
+                    second_pass_resize_method=second_pass_resize_method,
+                    second_pass_resize_device=second_pass_resize_device,
+                    second_pass_resize_batch_size=second_pass_resize_batch_size)
                 if return_internal_outputs:
                     output_latent = segment_latent
                     output_positive = segment_positive
@@ -2234,7 +2555,10 @@ class H3DirectorStudio:
                 try:
                     exported_path, export_sig, copied = _export_segment_video(
                         video_path, output_dir, filename_prefix, seg_idx,
-                        min(_segment_sizes[k][0], _segment_sizes[k][1]),
+                        min(_second_pass_resolution(
+                            _segment_sizes[k][0], _segment_sizes[k][1],
+                            second_pass_megapixels)) if second_pass_enabled
+                        else min(_segment_sizes[k][0], _segment_sizes[k][1]),
                         previous_meta=meta_data, force=generated_now)
                 except Exception as e:
                     raise RuntimeError("[H3导演台] 段%d成片导出失败：%s" % (seg_idx, e)) from e
