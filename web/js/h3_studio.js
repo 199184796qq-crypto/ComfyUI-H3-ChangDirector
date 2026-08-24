@@ -4,7 +4,7 @@ import { H3_TEXT_TEMPLATES } from "./h3_templates.js";
 
 /* 前端版本号：与 routes.py 的 BACKEND_VERSION 对应。
    status 接口返回的后端版本若与此不一致（用户改了代码但没重启/没强刷），状态栏红字提示。 */
-const H3S_VERSION = "2.27.6";
+const H3S_VERSION = "2.27.7";
 const activeProjectIds = new Map();
 
 function newProjectId() {
@@ -2073,6 +2073,27 @@ function buildStudio(node) {
     wrap.appendChild(body);
     parent.appendChild(wrap);
   };
+  const appendSegmentEnabledControl = (row, segment, segmentIndex) => {
+    // 不读取或写入其它段，也不复用公共 widget；每个复选框只闭包绑定当前片段对象。
+    segment.enabled = segment.enabled !== false;
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.id = `h3-segment-enabled-${node.id}-${curMode()}-${segmentIndex}`;
+    checkbox.checked = segment.enabled === true;
+    checkbox.title = `仅启用或停用段${segmentIndex + 1}，不会修改其它片段`;
+    checkbox.addEventListener("change", (event) => {
+      event.stopPropagation();
+      segment.enabled = checkbox.checked === true;
+      save();
+      renderTimeline();
+      status.textContent = `段${segmentIndex + 1}已${segment.enabled ? "启用" : "停用"}，其它片段保持不变`;
+    });
+    const label = document.createElement("label");
+    label.htmlFor = checkbox.id;
+    label.textContent = "启用（仅本段）";
+    label.style.cursor = "pointer";
+    row.append(checkbox, label);
+  };
   const btnPreviewToggle = mk("button", "h3s-btn", "隐藏播放器");
   const syncPreviewToggle = () => {
     const hidden = node.properties.h3_segment_preview_hidden === true;
@@ -3023,13 +3044,7 @@ function buildStudio(node) {
     /* ======== ⓪ 段信息行（v2.7：分段回归——每段独立时长/启用）======== */
     const row0 = mk("div", "h3s-row");
     row0.appendChild(mk("b", null, `段 ${sel + 1}`));
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = s.enabled;
-    cb.title = "启用本段（取消勾选则运行时跳过）";
-    cb.addEventListener("change", () => { s.enabled = cb.checked; save(); renderTimeline(); });
-    row0.appendChild(cb);
-    row0.appendChild(mk("span", null, "启用"));
+    appendSegmentEnabledControl(row0, s, sel);
     appendResolutionControls(row0, s);
     row0.appendChild(mk("span", "h3s-hint", "时长（秒）："));
     const durW = node.widgets.find((w) => w.name === "时长秒");  // 节点默认值（新建段用）
@@ -3803,13 +3818,7 @@ function buildStudio(node) {
     /* ======== ① 段信息行：启用 / 时长 / 帧率 / 种子 / 分辨率 / 续接尾帧 ======== */
     const row0 = mk("div", "h3s-row");
     row0.appendChild(mk("b", null, `段 ${sel + 1}`));
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = s.enabled;
-    cb.title = "启用本段（取消勾选则运行时跳过）";
-    cb.addEventListener("change", () => { s.enabled = cb.checked; save(); renderTimeline(); });
-    row0.appendChild(cb);
-    row0.appendChild(mk("span", null, "启用"));
+    appendSegmentEnabledControl(row0, s, sel);
     appendResolutionControls(row0, s);
     row0.appendChild(mk("span", "h3s-hint", "时长（秒）："));
     const din = mk("input", "h3s-durinput");
@@ -4515,12 +4524,7 @@ function buildStudio(node) {
 
     const row = mk("div", "h3s-row");
     row.appendChild(mk("b", null, `段 ${sel + 1}`));
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = s.enabled;
-    cb.addEventListener("change", () => { s.enabled = cb.checked; save(); renderTimeline(); });
-    row.appendChild(cb);
-    row.appendChild(mk("span", null, "启用"));
+    appendSegmentEnabledControl(row, s, sel);
 
     appendResolutionControls(row, s);
     row.appendChild(mk("span", null, "时长"));
