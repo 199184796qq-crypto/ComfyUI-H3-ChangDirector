@@ -51,6 +51,7 @@ CACHE_SCHEMA = 12  # v2.26.0：段级 Add Guide 时间锚点
 # MiniMaxH3ImageToVideo，并由本段 refs 的顺序提供首帧/尾帧。
 GENERATION_MODES = {"multi_ref", "text_to_video", "first_frame", "first_last_frame", "last_frame"}
 MOTION_CONTEXT_SOURCES = {"local_latent", "upload_latent", "aliyun_oss", "video"}
+MOTION_CONTEXT_KEY = "motion_context_index"
 
 SEGMENT_ASPECT_RATIOS = {
     "1:1 (Square)": (1, 1),
@@ -550,6 +551,94 @@ def _motion_context_trim(TrimClass, images, trim_frames, audio, fps,
     if not isinstance(result, (tuple, list)) or len(result) < 2:
         raise RuntimeError("[H3导演台] Motion Context Trim 返回值格式不兼容。")
     return result[0], result[1]
+
+
+def _snapshot_minimax_conditioning(conditioning):
+    """Clone H3 metadata while sharing its potentially large tensors."""
+    out = []
+    for embedding, metadata in conditioning:
+        copied = dict(metadata)
+        for field in ("minimax_keyframes", "minimax_refs"):
+            blocks = metadata.get(field)
+            if blocks is not None:
+                copied[field] = [dict(block) if isinstance(block, dict) else block
+                                 for block in blocks]
+        out.append([embedding, copied])
+    return out
+
+
+def _conditioning_after_motion_trim(base_conditioning, motion_conditioning,
+                                    final_conditioning, trim_frames,
+                                    total_frames):
+    """Return CONDITIONING aligned to Motion Context's delivered timeline.
+
+    Motion Context conditions the full sampler latent, including the pinned
+    head that is removed from the decoded result. Reusing that conditioning
+    with a latent encoded from the delivered frames leaves stale pinned rows
+    and frame positions behind. Build the external positive from the
+    pre-Motion condition instead, then retain the segment Guides that were
+    appended after Motion and shift every surviving anchor onto frame zero of
+    the delivered clip.
+
+    The tensors are deliberately shared; only metadata dictionaries and
+    temporal keyframe dictionaries are cloned.
+    """
+    trim_frames = max(0, int(trim_frames))
+    if trim_frames <= 0:
+        return final_conditioning
+
+    visible_frames = max(1, int(total_frames) - trim_frames)
+    out = []
+    for entry_index, final_entry in enumerate(final_conditioning):
+        embedding, final_meta = final_entry
+        base_meta = (base_conditioning[entry_index][1]
+                     if entry_index < len(base_conditioning) else {})
+        motion_meta = (motion_conditioning[entry_index][1]
+                       if entry_index < len(motion_conditioning) else {})
+
+        # Add Guide appends to the keyframe list after Motion Context. The
+        # prefix length recorded before Guides therefore separates the user's
+        # anchors from Motion's disposable pinned-head anchors without relying
+        # on a particular Motion Context implementation.
+        final_keyframes = list(final_meta.get("minimax_keyframes") or [])
+        motion_keyframe_count = len(motion_meta.get("minimax_keyframes") or [])
+        guide_keyframes = final_keyframes[motion_keyframe_count:]
+        source_keyframes = list(base_meta.get("minimax_keyframes") or []) + guide_keyframes
+
+        keyframes = []
+        for keyframe in source_keyframes:
+            try:
+                frame_index = int(keyframe.get(
+                    MOTION_CONTEXT_KEY,
+                    keyframe.get("resolved_frame_index", 0)))
+            except (TypeError, ValueError):
+                frame_index = 0
+            if frame_index < trim_frames:
+                continue
+            shifted = dict(keyframe)
+            shifted.pop(MOTION_CONTEXT_KEY, None)
+            shifted["resolved_frame_index"] = min(
+                visible_frames - 1, frame_index - trim_frames)
+            keyframes.append(shifted)
+
+        meta = dict(final_meta)
+        if keyframes:
+            meta["minimax_keyframes"] = keyframes
+        else:
+            meta.pop("minimax_keyframes", None)
+
+        # Keep only the original Ref2VA references. In particular this drops
+        # Motion Context's timeline audio reference, which belongs entirely to
+        # the removed head.
+        base_refs = base_meta.get("minimax_refs")
+        if base_refs is not None:
+            meta["minimax_refs"] = list(base_refs)
+        else:
+            meta.pop("minimax_refs", None)
+
+        meta["minimax_frame_count"] = visible_frames
+        out.append([embedding, meta])
+    return out
 
 
 def _context_directory(value):
@@ -1593,6 +1682,7 @@ class H3DirectorStudio:
         # 按索引取前两个，避免 "too many values to unpack (expected 2)"。
         _res = out.result
         cond, latent = _res[0], _res[1]
+        base_conditioning = _snapshot_minimax_conditioning(cond)
         del out, _res, ref_images, ref_audios, ref_videos, ref_video_audios, included, first_frame_tensor
 
         # Motion Context 可从任意段开始。本地 index=0 只建立新链并保存
@@ -1656,6 +1746,8 @@ class H3DirectorStudio:
         else:
             _log("[H3导演台] 段%d MotionContext 已关闭：不加载上一段 clip" % seg_idx)
 
+        motion_conditioning = _snapshot_minimax_conditioning(cond)
+
         # 段级 Guide 在 Motion Context 之后追加。这样多个 Guide 的 positive
         # 会像画布上连续串联的 Add Guide 一样逐个累积，并且其秒数以最终导出
         # （已去掉上下文前缀）的片段为准。
@@ -1693,7 +1785,16 @@ class H3DirectorStudio:
             callback=callback, disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=noise.seed)
         samples = samples.to(comfy.model_management.intermediate_device())
         output_latent = {"samples": samples} if return_internal_outputs else None
-        output_positive = cond if return_internal_outputs else None
+        output_positive = None
+        if return_internal_outputs:
+            output_positive = _conditioning_after_motion_trim(
+                base_conditioning, motion_conditioning, cond,
+                trim_frames=trim_frames, total_frames=length)
+            if trim_frames > 0:
+                _log("[H3导演台] 段%d positive 已切换为裁剪后时间轴：%d -> %d 帧" % (
+                    seg_idx, length, max(1, length - trim_frames)))
+            else:
+                _log("[H3导演台] 段%d positive 保持原始条件（未实际应用 Motion 裁剪）" % seg_idx)
         output_noise = noise if return_internal_outputs else None
 
         # 无论 MotionContext 段级开关是否开启，每个已生成段都保存 H3 AV latent。
@@ -1739,7 +1840,8 @@ class H3DirectorStudio:
 
         # 采样和 VAE 解码已经结束：先释放 GPU 相关对象，再做 numpy 转换和 FFmpeg 编码。
         # 这样不会让近 20GB 的模型搬运状态与整段 RGB 帧在内存里长时间重叠。
-        del samples, video_lat, latent_image, cond, latent, guider, callback, x0_output, noise, sigmas, sampler
+        del samples, video_lat, latent_image, cond, latent, base_conditioning, motion_conditioning
+        del guider, callback, x0_output, noise, sigmas, sampler
         gc.collect()
         comfy.model_management.soft_empty_cache()
         comfy.model_management.cleanup_models()
