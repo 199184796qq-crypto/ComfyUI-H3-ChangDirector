@@ -977,7 +977,7 @@ def _output_connected(prompt, unique_id, output_index):
 
 
 def _upstream_model_kind(prompt, unique_id, input_name="model"):
-    """只读检查模型输入的上游节点，识别 FL2VA / Ref2VA。
+    """只读检查模型输入的上游节点，识别 FL2VA / Ref2VA / Remix。
 
     ComfyUI 的 MODEL 对象没有稳定公开的文件名属性；运行 prompt 图里则会保留
     UNETLoader 的模型文件名。这里只返回分类结果，不记录或输出上游字符串。
@@ -1016,6 +1016,8 @@ def _upstream_model_kind(prompt, unique_id, input_name="model"):
         return "not_connected"
     visit(link[0], set())
     marker = "\n".join(texts).lower()
+    if "remix" in marker or "h3remixmodelloader" in marker:
+        return "remix"
     is_fl2va = any(x in marker for x in ("fl2va", "fl2v", "firstlast", "first_last"))
     is_ref2va = any(x in marker for x in ("ref2va", "ref2v", "reference_to_video"))
     if is_fl2va and not is_ref2va:
@@ -1028,7 +1030,7 @@ def _upstream_model_kind(prompt, unique_id, input_name="model"):
 def _select_h3_task(primary_model_kind, has_optional_fl2va, has_references,
                     has_first_frame, prefer_fl2va):
     """决定本段使用 FL2VA 还是 Ref2VA；独立函数便于兼容性测试。"""
-    fl2va_available = bool(has_optional_fl2va) or primary_model_kind == "fl2va"
+    fl2va_available = bool(has_optional_fl2va) or primary_model_kind in ("fl2va", "remix")
     # 多参考模式允许主 model 直接接 FL2VA，采样仍走 FL2VA；不再因模型类型
     # 与参考素材同时存在而拦截。FL2VA 原生不接收多参考输入，故这些输入不会
     # 传给其采样器。
@@ -1936,9 +1938,10 @@ class H3DirectorStudio:
             # 端点模式只使用主 model 输入，不要求也不读取可选 fl2va_model。
             # 这样主模型已接 FL2VA 的工作流不必额外接一根重复模型线；若主模型
             # 不是 FL2VA，明确阻止它以错误模型进入 ImageToVideo。
-            if primary_model_kind != "fl2va":
+            if primary_model_kind not in ("fl2va", "remix"):
                 actual = {
                     "ref2va": "Ref2VA",
+                    "remix": "Remix",
                     "not_connected": "未连接模型",
                     "unknown": "无法识别的模型",
                 }.get(primary_model_kind, "非 FL2VA 模型")
@@ -2403,7 +2406,7 @@ class H3DirectorStudio:
 
         primary_model_kind = _upstream_model_kind(h3_prompt_graph, h3_unique_id, "model")
         # 可选 FL2VA 或主口识别到 FL2VA 时，允许单模型 FL2VA/t2va 与硬首帧续接。
-        tail_mode = "fl2v" if (fl2va_model is not None or primary_model_kind == "fl2va") else "ref2v"
+        tail_mode = "fl2v" if (fl2va_model is not None or primary_model_kind in ("fl2va", "remix")) else "ref2v"
         ref_model_sig = _upstream_fingerprint(h3_prompt_graph, h3_unique_id, "model")
         fl_model_sig = _upstream_fingerprint(h3_prompt_graph, h3_unique_id, "fl2va_model")
         second_pass_model_sig = _upstream_fingerprint(h3_prompt_graph, h3_unique_id, "二采模型")
@@ -2415,6 +2418,7 @@ class H3DirectorStudio:
         model_note = {
             "fl2va": "主模型已识别为 FL2VA（支持单模型模式）",
             "ref2va": "主模型已识别为 Ref2VA",
+            "remix": "主模型已识别为 Remix（自动兼容 FL2VA / Ref2VA）",
             "unknown": "主模型类型未识别，按 Ref2VA 兼容模式",
             "not_connected": "主模型上游未连接",
         }.get(primary_model_kind, "主模型类型未知")
